@@ -1,18 +1,17 @@
 mod bindings;
 mod testkey;
+mod hasher;
 
+use crate::hasher::Hasher;
 use std::io::Read;
 use std::io::Seek;
 use std::io::Write;
 use std::os::unix::fs::MetadataExt;
 
-use bindings::AvbAlgorithmType;
 use bindings::AvbDescriptorTag;
 use bindings::AvbFooter;
 use bindings::AvbRSAPublicKeyHeader;
 use bindings::AvbVBMetaImageHeader;
-
-use sha2::Digest;
 
 use num_bigint_dig::BigInt;
 use num_bigint_dig::ExtendedGcd;
@@ -29,7 +28,6 @@ use rsa::signature::SignatureEncoding;
 use rsa::signature::hazmat::PrehashSigner;
 use rsa::signature::hazmat::PrehashVerifier;
 use rsa::traits::PublicKeyParts;
-use sha2::Sha512;
 
 use crate::bindings::AVB_FOOTER_MAGIC;
 use crate::bindings::AVB_MAGIC;
@@ -41,7 +39,7 @@ use testkey::TESTKEY_4096;
 
 use log::{debug, error, info, warn};
 
-type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 fn avb_vbmeta_image_header_to_host_byte_order(
     src: &AvbVBMetaImageHeader,
@@ -171,6 +169,7 @@ const HEADER_SIZE: usize = std::mem::size_of::<AvbVBMetaImageHeader>();
 const PUBLIC_EXPONENT: u32 = 65537u32;
 const VBMETA_ALIGN: usize = 64;
 
+
 fn main() -> Result<()> {
     // Default log level is info. Set RUST_LOG=debug for more logs.
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -215,17 +214,6 @@ fn main() -> Result<()> {
         return Err("VBMeta magic is not valid.".into());
     }
 
-    const SHA256_ALGOES: [u32; 3] = [
-        AvbAlgorithmType::AVB_ALGORITHM_TYPE_SHA256_RSA2048 as u32,
-        AvbAlgorithmType::AVB_ALGORITHM_TYPE_SHA256_RSA4096 as u32,
-        AvbAlgorithmType::AVB_ALGORITHM_TYPE_SHA256_RSA8192 as u32,
-    ];
-    const SHA512_ALGOES: [u32; 3] = [
-        AvbAlgorithmType::AVB_ALGORITHM_TYPE_SHA512_RSA2048 as u32,
-        AvbAlgorithmType::AVB_ALGORITHM_TYPE_SHA512_RSA4096 as u32,
-        AvbAlgorithmType::AVB_ALGORITHM_TYPE_SHA512_RSA8192 as u32,
-    ];
-
     // VBMeta = AvbVBMetaImageHeader + Authentication data + Auxiliary data
     // Authentication data = hash + signature
     // Auxiliary data = descriptor + public key + publib key metadata
@@ -246,17 +234,9 @@ fn main() -> Result<()> {
     message.extend(&auxiliary_data);
 
     let algo_type = header.algorithm_type;
-    let hash_calc = if SHA256_ALGOES.contains(&algo_type) {
-        let mut hash_context = Sha256::new();
-        hash_context.update(&message);
-        hash_context.finalize()[..].to_vec()
-    } else if SHA512_ALGOES.contains(&algo_type) {
-        let mut hash_context = Sha512::new();
-        hash_context.update(&message);
-        hash_context.finalize()[..].to_vec()
-    } else {
-        return Err(format!("Unknown algorithm type: {}", algo_type).into());
-    };
+    let mut hasher = Hasher::new(algo_type)?;
+    hasher.update(&message);
+    let hash_calc = hasher.finalize();
 
     let hash = &authentication_data
         [header.hash_offset as usize..header.hash_offset as usize + header.hash_size as usize];
@@ -353,19 +333,10 @@ fn main() -> Result<()> {
             debug!("Digest: {}", hex(digest));
 
             let hash_partition_calc = if original_image_size != 0 {
-                let hash_partition_calc = if algo_name == "sha256" {
-                    let mut hash_context = Sha256::new();
-                    hash_context.update(&salt);
-                    hash_context.update(&image_data);
-                    hash_context.finalize()[..].to_vec()
-                } else if algo_name == "sha512" {
-                    let mut hash_context = Sha512::new();
-                    hash_context.update(&salt);
-                    hash_context.update(&image_data);
-                    hash_context.finalize()[..].to_vec()
-                } else {
-                    return Err("Unknown digest algorithm".into());
-                };
+                let mut hasher = Hasher::new_by_name(&algo_name)?;
+                hasher.update(&salt);
+                hasher.update(&image_data);
+                let hash_partition_calc = hasher.finalize();
                 info!("New partition hash: {}", hex(&hash_partition_calc));
                 if hash_partition_calc == digest {
                     info!("Partition hashes match");
@@ -422,11 +393,7 @@ fn main() -> Result<()> {
     let signing_key = SigningKey::<Sha256>::new(testkey.clone());
 
     new_header.hash_offset = 0;
-    new_header.hash_size = if SHA256_ALGOES.contains(&algo_type) {
-        32
-    } else {
-        64
-    };
+    new_header.hash_size = Hasher::digest_size(algo_type)? as u64;
     new_header.signature_offset = new_header.hash_size;
     new_header.signature_size = testkey.size() as u64;
 
@@ -458,23 +425,12 @@ fn main() -> Result<()> {
     });
     // Signature target is VBMeta header + Auxiliary data block.
     let algo_type = new_header.algorithm_type;
-    let new_hash = if SHA256_ALGOES.contains(&algo_type) {
-        let mut hash_context = Sha256::new();
-        hash_context.update(&vbmeta_header_bytes);
-        hash_context.update(&new_descriptors_data);
-        hash_context.update(&pubkey_bytes);
-        hash_context.update(&auxiliary_pad);
-        hash_context.finalize()[..].to_vec()
-    } else if SHA512_ALGOES.contains(&algo_type) {
-        let mut hash_context = Sha512::new();
-        hash_context.update(&vbmeta_header_bytes);
-        hash_context.update(&new_descriptors_data);
-        hash_context.update(&pubkey_bytes);
-        hash_context.update(&auxiliary_pad);
-        hash_context.finalize()[..].to_vec()
-    } else {
-        return Err(format!("Unknown algorithm type: {}", algo_type).into());
-    };
+    let mut hasher = Hasher::new(algo_type)?;
+    hasher.update(&vbmeta_header_bytes);
+    hasher.update(&new_descriptors_data);
+    hasher.update(&pubkey_bytes);
+    hasher.update(&auxiliary_pad);
+    let new_hash = hasher.finalize();
     let new_signature = signing_key.sign_prehash(&new_hash)?.to_bytes();
 
     let mut vbmeta_bytes = vbmeta_header_bytes;
