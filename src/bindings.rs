@@ -1282,6 +1282,12 @@ impl ::core::ops::BitAndAssign for AvbVBMetaImageFlags {
         self.0 &= rhs.0;
     }
 }
+unsafe extern "C" {
+    pub fn avb_vbmeta_image_header_to_host_byte_order(
+        src: *const AvbVBMetaImageHeader,
+        dest: *mut AvbVBMetaImageHeader,
+    );
+}
 #[repr(transparent)]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct AvbVBMetaImageFlags(pub core::ffi::c_uint);
