@@ -32,11 +32,15 @@ use rsa::signature::hazmat::PrehashSigner;
 use rsa::signature::hazmat::PrehashVerifier;
 use rsa::traits::PublicKeyParts;
 
+use crate::bindings::AVB_FOOTER_MAGIC;
+use crate::bindings::AVB_FOOTER_MAGIC_LEN;
 use crate::bindings::AvbDescriptor;
 use crate::bindings::AvbHashDescriptor;
 
 use testkey::TESTKEY_2048;
 use testkey::TESTKEY_4096;
+
+use log::{debug, error, info, warn};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -171,12 +175,14 @@ const MAX_FOOTER_SIZE: usize = 4096;
 const VBMETA_ALIGN: usize = 64;
 
 fn main() -> Result<()> {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let mut args = std::env::args().skip(1);
     let filename = args.next().unwrap();
     let out_filename = args.next();
     let mut f = std::fs::File::open(&filename)?;
     let filesize = std::fs::metadata(&filename)?.size() as usize;
 
+    info!("Parsing VBMeta for {filename}.");
     let (header_offset, original_image_size) = if filesize >= FOOTER_SIZE {
         f.seek(std::io::SeekFrom::End(-(FOOTER_SIZE as i64)))?;
         let mut buf = vec![0; FOOTER_SIZE];
@@ -184,9 +190,9 @@ fn main() -> Result<()> {
         let footer = buf.as_ptr() as *const AvbFooter;
         let mut footer_dest = AvbFooter::default();
         avb_footer_to_host_byte_order(unsafe { &*footer }, &mut footer_dest);
-        if &footer_dest.magic == b"AVBf" {
+        if footer_dest.magic == AVB_FOOTER_MAGIC[0..4] {
             let vbmeta_size = footer_dest.vbmeta_size;
-            println!("vbmeta size: {}", vbmeta_size);
+            info!("VBMeta size in footer: {}", vbmeta_size);
             (footer_dest.vbmeta_offset, footer_dest.original_image_size)
         } else {
             (0, 0)
@@ -194,8 +200,8 @@ fn main() -> Result<()> {
     } else {
         (0, 0)
     };
-    println!(
-        "header offset: {} original image size: {}",
+    info!(
+        "VBMeta header offset: {} original image size: {}",
         header_offset, original_image_size
     );
 
@@ -208,7 +214,7 @@ fn main() -> Result<()> {
     avb_vbmeta_image_header_to_host_byte_order(header_src, &mut header);
 
     match &header.magic {
-        b"AVB0" => println!("Magic is AVB_MAGIC"),
+        b"AVB0" => info!("Magic ok."),
         _ => return Err("VBMeta magic is not valid.".into()),
     }
 
@@ -252,34 +258,24 @@ fn main() -> Result<()> {
     hash_context.update(&message);
     let hash_calc = hash_context.finish();
     let hash_calc = hash_calc.as_ref();
-    println!("{:#?}", hex(hash_calc));
 
     let hash = &authentication_data
         [header.hash_offset as usize..header.hash_offset as usize + header.hash_size as usize];
-    println!("{:#?}", hex(hash));
 
     let vbmeta_hash_matches = hash_calc == hash;
     if hash_calc == hash {
-        println!("Hash matches");
+        info!("Hashes of VBMeta matched");
     }
 
     let auth_data_size = header.authentication_data_block_size;
     let pubkey_size = header.public_key_size;
     let pubkey_offset = header.public_key_offset;
-    println!(
-        "auth data size: {} {} {}",
-        auth_data_size, pubkey_offset, pubkey_size
-    );
     let public_key_data = &auxiliary_data[header.public_key_offset as usize
         ..header.public_key_offset as usize + header.public_key_size as usize];
     let public_key_header = public_key_data.as_ptr() as *const AvbRSAPublicKeyHeader;
     let pubkey_header_size = std::mem::size_of::<AvbRSAPublicKeyHeader>();
     let num_bits = unsafe { (*public_key_header).key_num_bits.to_be() };
-    println!("key num bits: {} n0inv: {}", num_bits, unsafe {
-        (*public_key_header).n0inv.to_be()
-    });
     let modulus = &public_key_data[pubkey_header_size..pubkey_header_size + num_bits as usize / 8];
-    println!("modulus: {}", hex(modulus));
 
     let n = BigUint::from_bytes_be(modulus);
     let e = BigUint::from(PUBLIC_EXPONENT);
@@ -293,11 +289,11 @@ fn main() -> Result<()> {
     let signature = rsa::pkcs1v15::Signature::try_from(sig_value)?;
     match verifying_key.verify_prehash(hash, &signature) {
         Ok(_) => {
-            println!("Verify Ok");
+            info!("Verify Ok");
             vbmeta_signature_correct = true;
         }
         Err(e) => {
-            println!("Verify Failed: {e}");
+            info!("Verify Failed: {e}");
         }
     }
     let testkey = if num_bits == 2048 {
@@ -316,6 +312,7 @@ fn main() -> Result<()> {
     f.read_exact(&mut image_data)?;
 
     let mut partition_hash_matches = false;
+    let mut parititon_size_check = false;
     let mut pos = 0;
     let mut new_descriptors_data = vec![];
     while pos < descriptors_data.len() {
@@ -323,10 +320,7 @@ fn main() -> Result<()> {
         let descriptor_header_size = std::mem::size_of::<AvbDescriptor>();
         let tag = unsafe { (*descriptor_header).tag.to_be() };
         let num_bytes_following = unsafe { (*descriptor_header).num_bytes_following.to_be() };
-        println!(
-            "descriptor tag: {} num_bytes_following: {}",
-            tag, num_bytes_following
-        );
+        info!("Descriptor tag: {} num_bytes_following: {}", tag, num_bytes_following);
 
         if tag == AvbDescriptorTag::AVB_DESCRIPTOR_TAG_HASH as u64 {
             let hash_descriptor =
@@ -353,15 +347,14 @@ fn main() -> Result<()> {
             let algo_name = String::from_utf8(hash_dest.hash_algorithm.to_vec())?
                 .trim_end_matches('\0')
                 .to_string();
-            // println!("algo: {}", algo_name);
-            // println!(
-            //     "partition name: {}",
-            //     String::from_utf8(partition_name.to_vec())?
-            //         .trim_end_matches('\0')
-            //         .to_string()
-            // );
-            // println!("salt: {}", hex(salt));
-            // println!("digest: {}", hex(digest));
+            debug!("Hash descriptor information:");
+            debug!("Algorithm: {}", algo_name);
+            debug!("partition name: {}", String::from_utf8(partition_name.to_vec())?
+                    .trim_end_matches('\0')
+                    .to_string()
+            );
+            debug!("Salt  : {}", hex(salt));
+            debug!("Digest: {}", hex(digest));
 
             let hash_partition_calc = if original_image_size != 0 {
                 let mut hash_context = if algo_name == "sha256" {
@@ -375,12 +368,12 @@ fn main() -> Result<()> {
                 hash_context.update(&image_data);
                 let hash_partition_calc = hash_context.finish();
                 let hash_partition_calc = hash_partition_calc.as_ref().to_owned();
-                println!("New partition hash: {}", hex(&hash_partition_calc));
+                info!("New partition hash: {}", hex(&hash_partition_calc));
                 if hash_partition_calc == digest {
-                    println!("Partition hash matches");
+                    info!("Partition hash matches");
                     partition_hash_matches = true;
                 } else {
-                    println!("Hash does not match");
+                    info!("Hashes did not match");
                 }
                 hash_partition_calc
             } else {
@@ -388,7 +381,13 @@ fn main() -> Result<()> {
             };
 
             // Fix up it because many(?) boot modification tools don't fix this. They only patch original_image_size on AvbFooter.
-            hash_dest.image_size = original_image_size;
+            if hash_dest.image_size != original_image_size {
+                info!("Partition size mismatch in hash descriptor. Fix it.");
+                hash_dest.image_size = original_image_size;
+            } else {
+                info!("Partition size matches");
+                parititon_size_check = true;
+            }
 
             let mut new_hash_desc = unsafe { std::mem::zeroed::<AvbHashDescriptor>() };
             avb_hash_descriptor_to_host_byte_order(&hash_dest, &mut new_hash_desc);
@@ -409,9 +408,12 @@ fn main() -> Result<()> {
         }
     }
 
-    if vbmeta_hash_matches && vbmeta_signature_correct && partition_hash_matches {
-        println!("Hash and signature are all okay.");
+    if vbmeta_hash_matches && vbmeta_signature_correct && partition_hash_matches && parititon_size_check {
+        info!("Hash and signature are all okay. So no need to re-sign. Exit.");
+        return Ok(());
     }
+
+    // Re-generate VBMeta structures and sign them.
 
     let mut new_header = header.clone();
 
@@ -457,14 +459,15 @@ fn main() -> Result<()> {
         return Err(format!("Unknown algorithm type: {}", algo_type).into());
     };
 
-    let mut vbmeta_bytes = vec![];
-    vbmeta_bytes.extend_from_slice(unsafe {
+    let mut vbmeta_header_bytes = vec![];
+    vbmeta_header_bytes.extend_from_slice(unsafe {
         std::slice::from_raw_parts(
             &new_header_dest as *const AvbVBMetaImageHeader as *const u8,
             std::mem::size_of::<AvbVBMetaImageHeader>(),
         )
     });
-    hash_context.update(&vbmeta_bytes);
+    // Signature target is VBMeta header + Auxiliary data block.
+    hash_context.update(&vbmeta_header_bytes);
     hash_context.update(&new_descriptors_data);
     hash_context.update(&pubkey_bytes);
     hash_context.update(&auxiliary_pad);
@@ -472,6 +475,7 @@ fn main() -> Result<()> {
     let new_hash = new_hash.as_ref();
     let new_signature = signing_key.sign_prehash(new_hash)?.to_bytes();
 
+    let mut vbmeta_bytes = vbmeta_header_bytes;
     vbmeta_bytes.extend(new_hash);
     vbmeta_bytes.extend(new_signature);
     pad_right(&mut vbmeta_bytes, VBMETA_ALIGN);
@@ -480,7 +484,7 @@ fn main() -> Result<()> {
     vbmeta_bytes.extend(auxiliary_pad);
 
     let mut footer = unsafe { std::mem::zeroed::<AvbFooter>() };
-    footer.magic = *b"AVBf";
+    footer.magic.copy_from_slice(&AVB_FOOTER_MAGIC[..4]);
     footer.original_image_size = original_image_size;
     footer.vbmeta_offset = original_image_size;
     footer.vbmeta_size = vbmeta_bytes.len() as u64;
@@ -492,7 +496,7 @@ fn main() -> Result<()> {
     drop(f);
 
     if let Some(out_filename) = out_filename {
-        println!("Writing output file: {out_filename}");
+        info!("Writing output file: {out_filename}");
         let mut f = std::fs::File::create(out_filename)?;
         f.write_all(&image_data)?;
         f.write_all(&vbmeta_bytes)?;
