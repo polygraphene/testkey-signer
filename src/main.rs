@@ -386,9 +386,15 @@ fn main() -> Result<()> {
             } else {
                 return Err("Not supported now".into());
             };
+
+            // Fix up it because many(?) boot modification tools don't fix this. They only patch original_image_size on AvbFooter.
+            hash_dest.image_size = original_image_size;
+
+            let mut new_hash_desc = unsafe { std::mem::zeroed::<AvbHashDescriptor>() };
+            avb_hash_descriptor_to_host_byte_order(&hash_dest, &mut new_hash_desc);
             new_descriptors_data.extend_from_slice(unsafe {
                 std::slice::from_raw_parts(
-                    hash_descriptor as *const AvbHashDescriptor as *const u8,
+                    &new_hash_desc as *const AvbHashDescriptor as *const u8,
                     hash_descriptor_size,
                 )
             });
