@@ -115,15 +115,65 @@ fn pad_right(val: &mut Vec<u8>, align: usize) {
     val.extend(vec![0; pad_size(val.len(), align)]);
 }
 
+fn convert_to_avb_pubkey(pubkey: &RsaPublicKey) -> Result<Vec<u8>> {
+    let num_key_bytes = pubkey.size();
+
+    let modulus_bytes = to_fixed_length(&pubkey.n(), num_key_bytes)?;
+
+    let n_signed = BigInt::from_biguint(num_bigint_dig::Sign::Plus, pubkey.n().clone());
+    let r = BigInt::one() << 32;
+    let egcd = n_signed.extended_gcd(&r);
+
+    let n0inv = if egcd.0.is_one() {
+        let inv = (egcd.1 % &r + &r) % &r;
+        let n0_prime = (&r - inv) % &r;
+        n0_prime.to_biguint()
+    } else {
+        None
+    };
+    let n0inv = match n0inv {
+        Some(s) => match s.to_u32() {
+            Some(s) => s,
+            None => return Err("Failed to calculate n0inv".into()),
+        },
+        None => return Err("Failed to calculate n0inv".into()),
+    };
+    let mut pubkey_header = AvbRSAPublicKeyHeader::default();
+    pubkey_header.key_num_bits = num_key_bytes as u32 * 8;
+    pubkey_header.n0inv = n0inv;
+
+    let two = BigUint::from(2u8);
+    let exponent = BigUint::from(2 * (num_key_bytes * 8));
+
+    let rr = two.modpow(&exponent, pubkey.n());
+    let rr_bytes = to_fixed_length(&rr, num_key_bytes)?;
+
+    let mut pubkey_bytes = vec![];
+    let mut pubkey_header_dest = AvbRSAPublicKeyHeader::default();
+    avb_pubkey_to_host_byte_order(&pubkey_header, &mut pubkey_header_dest);
+    pubkey_bytes.extend_from_slice(unsafe {
+        std::slice::from_raw_parts(
+            &pubkey_header_dest as *const AvbRSAPublicKeyHeader as *const u8,
+            std::mem::size_of::<AvbRSAPublicKeyHeader>(),
+        )
+    });
+    pubkey_bytes.extend(modulus_bytes);
+    pubkey_bytes.extend(rr_bytes);
+
+    Ok(pubkey_bytes)
+}
+
 const FOOTER_SIZE: usize = std::mem::size_of::<AvbFooter>();
 const HEADER_SIZE: usize = std::mem::size_of::<AvbVBMetaImageHeader>();
 const PUBLIC_EXPONENT: u32 = 65537u32;
 const MAX_VBMETA_SIZE: usize = 64 * 1024;
 const MAX_FOOTER_SIZE: usize = 4096;
+const VBMETA_ALIGN: usize = 64;
 
 fn main() -> Result<()> {
-    let args = std::env::args();
-    let filename = args.skip(1).next().unwrap();
+    let mut args = std::env::args().skip(1);
+    let filename = args.next().unwrap();
+    let out_filename = args.next();
     let mut f = std::fs::File::open(&filename)?;
     let filesize = std::fs::metadata(&filename)?.size() as usize;
 
@@ -178,7 +228,7 @@ fn main() -> Result<()> {
     } else if SHA512_ALGOES.contains(&algo_type) {
         digest::Context::new(&digest::SHA512)
     } else {
-        panic!("Unknown algorithm type: {}", algo_type);
+        return Err(format!("Unknown algorithm type: {}", algo_type).into());
     };
 
     // VBMeta = AvbVBMetaImageHeader + Authentication data + Auxiliary data
@@ -255,13 +305,8 @@ fn main() -> Result<()> {
     } else if num_bits == 4096 {
         TESTKEY_4096
     } else {
-        return Err("Unknown rsa key size: {num_bits}".into());
+        return Err(format!("Unknown rsa key size: {num_bits}").into());
     };
-
-    let testkey = RsaPrivateKey::from_pkcs1_pem(String::from_utf8(testkey.to_vec())?.as_str())?;
-    let signing_key = SigningKey::<Sha256>::new(testkey.clone());
-
-    let new_signature = signing_key.sign_prehash(hash_calc)?.to_bytes();
 
     let descriptors_data = &auxiliary_data[header.descriptors_offset as usize
         ..header.descriptors_offset as usize + header.descriptors_size as usize];
@@ -308,13 +353,15 @@ fn main() -> Result<()> {
             let algo_name = String::from_utf8(hash_dest.hash_algorithm.to_vec())?
                 .trim_end_matches('\0')
                 .to_string();
-            println!("algo: {}", algo_name);
-            println!(
-                "partition name: {}",
-                String::from_utf8_lossy(partition_name)
-            );
-            println!("salt: {}", hex(salt));
-            println!("digest: {}", hex(digest));
+            // println!("algo: {}", algo_name);
+            // println!(
+            //     "partition name: {}",
+            //     String::from_utf8(partition_name.to_vec())?
+            //         .trim_end_matches('\0')
+            //         .to_string()
+            // );
+            // println!("salt: {}", hex(salt));
+            // println!("digest: {}", hex(digest));
 
             let hash_partition_calc = if original_image_size != 0 {
                 let mut hash_context = if algo_name == "sha256" {
@@ -328,12 +375,12 @@ fn main() -> Result<()> {
                 hash_context.update(&image_data);
                 let hash_partition_calc = hash_context.finish();
                 let hash_partition_calc = hash_partition_calc.as_ref().to_owned();
-                println!("{:#?}", hex(&hash_partition_calc));
+                println!("New partition hash: {}", hex(&hash_partition_calc));
                 if hash_partition_calc == digest {
                     println!("Partition hash matches");
                     partition_hash_matches = true;
                 } else {
-                    return Err("Hash does not match".into());
+                    println!("Hash does not match");
                 }
                 hash_partition_calc
             } else {
@@ -361,52 +408,11 @@ fn main() -> Result<()> {
     }
 
     let mut new_header = header.clone();
-    let testpubkey = testkey.to_public_key();
-    let num_key_bytes = num_bits as usize / 8;
 
-    let modulus_bytes = to_fixed_length(&testpubkey.n(), num_key_bytes)?;
+    let testkey = RsaPrivateKey::from_pkcs1_pem(String::from_utf8(testkey.to_vec())?.as_str())?;
+    let pubkey_bytes = convert_to_avb_pubkey(&testkey.to_public_key())?;
 
-    let n_signed = BigInt::from_biguint(num_bigint_dig::Sign::Plus, testpubkey.n().clone());
-    let r = BigInt::one() << 32;
-    let egcd = n_signed.extended_gcd(&r);
-
-    println!("egcd: {:?}", egcd);
-    let n0inv = if egcd.0.is_one() {
-        let inv = (egcd.1 % &r + &r) % &r;
-        let n0_prime = (&r - inv) % &r;
-        n0_prime.to_biguint()
-    } else {
-        None
-    };
-    let n0inv = match n0inv {
-        Some(s) => match s.to_u32() {
-            Some(s) => s,
-            None => return Err("Failed to calculate n0inv".into()),
-        },
-        None => return Err("Failed to calculate n0inv".into()),
-    };
-    let mut pubkey_header = AvbRSAPublicKeyHeader::default();
-    pubkey_header.key_num_bits = num_bits;
-    pubkey_header.n0inv = n0inv;
-    println!("Calculated n0inv: {}", n0inv);
-
-    let two = BigUint::from(2u8);
-    let exponent = BigUint::from(2 * num_bits);
-
-    let rr = two.modpow(&exponent, testpubkey.n());
-    let rr_bytes = to_fixed_length(&rr, num_key_bytes)?;
-
-    let mut pubkey_bytes = vec![];
-    let mut pubkey_header_dest = AvbRSAPublicKeyHeader::default();
-    avb_pubkey_to_host_byte_order(&pubkey_header, &mut pubkey_header_dest);
-    pubkey_bytes.extend_from_slice(unsafe {
-        std::slice::from_raw_parts(
-            &pubkey_header_dest as *const AvbRSAPublicKeyHeader as *const u8,
-            std::mem::size_of::<AvbRSAPublicKeyHeader>(),
-        )
-    });
-    pubkey_bytes.extend(modulus_bytes);
-    pubkey_bytes.extend(rr_bytes);
+    let signing_key = SigningKey::<Sha256>::new(testkey.clone());
 
     new_header.hash_offset = 0;
     new_header.hash_size = if SHA256_ALGOES.contains(&algo_type) {
@@ -415,11 +421,10 @@ fn main() -> Result<()> {
         64
     };
     new_header.signature_offset = new_header.hash_size;
-    new_header.signature_size = new_signature.len() as u64;
+    new_header.signature_size = testkey.size() as u64;
 
     new_header.authentication_data_block_size =
         new_header.signature_offset + new_header.signature_size;
-    const VBMETA_ALIGN: usize = 64;
     new_header.authentication_data_block_size += pad_size(new_header.authentication_data_block_size as usize, VBMETA_ALIGN) as u64;
 
     new_header.descriptors_offset = 0;
@@ -431,10 +436,20 @@ fn main() -> Result<()> {
 
     new_header.auxiliary_data_block_size =
         new_header.public_key_metadata_offset + new_header.public_key_metadata_size;
-    new_header.auxiliary_data_block_size += pad_size(new_header.auxiliary_data_block_size as usize, VBMETA_ALIGN) as u64;
+    let auxiliary_pad = vec![0; pad_size(new_header.auxiliary_data_block_size as usize, VBMETA_ALIGN)];
+    new_header.auxiliary_data_block_size += auxiliary_pad.len() as u64;
 
     let mut new_header_dest = unsafe { std::mem::zeroed::<AvbVBMetaImageHeader>() };
     avb_vbmeta_image_header_to_host_byte_order(&new_header, &mut new_header_dest);
+
+    let algo_type = new_header.algorithm_type;
+    let mut hash_context = if SHA256_ALGOES.contains(&algo_type) {
+        digest::Context::new(&digest::SHA256)
+    } else if SHA512_ALGOES.contains(&algo_type) {
+        digest::Context::new(&digest::SHA512)
+    } else {
+        return Err(format!("Unknown algorithm type: {}", algo_type).into());
+    };
 
     let mut vbmeta_bytes = vec![];
     vbmeta_bytes.extend_from_slice(unsafe {
@@ -443,12 +458,20 @@ fn main() -> Result<()> {
             std::mem::size_of::<AvbVBMetaImageHeader>(),
         )
     });
-    vbmeta_bytes.extend(hash_calc);
+    hash_context.update(&vbmeta_bytes);
+    hash_context.update(&new_descriptors_data);
+    hash_context.update(&pubkey_bytes);
+    hash_context.update(&auxiliary_pad);
+    let new_hash = hash_context.finish();
+    let new_hash = new_hash.as_ref();
+    let new_signature = signing_key.sign_prehash(new_hash)?.to_bytes();
+
+    vbmeta_bytes.extend(new_hash);
     vbmeta_bytes.extend(new_signature);
     pad_right(&mut vbmeta_bytes, VBMETA_ALIGN);
     vbmeta_bytes.extend(new_descriptors_data);
     vbmeta_bytes.extend(pubkey_bytes);
-    pad_right(&mut vbmeta_bytes, VBMETA_ALIGN);
+    vbmeta_bytes.extend(auxiliary_pad);
 
     let mut footer = unsafe { std::mem::zeroed::<AvbFooter>() };
     footer.magic = *b"AVBf";
@@ -462,12 +485,16 @@ fn main() -> Result<()> {
 
     drop(f);
 
-    let mut f = std::fs::File::create("bootout.img")?;
-    f.write_all(&image_data)?;
-    f.write_all(&vbmeta_bytes)?;
-    f.seek(std::io::SeekFrom::Start((filesize - FOOTER_SIZE) as u64))?;
-    f.write_all(unsafe { std::slice::from_raw_parts(&footer_dest as *const AvbFooter as *const u8, FOOTER_SIZE) })?;
-
+    if let Some(out_filename) = out_filename {
+        println!("Writing output file: {out_filename}");
+        let mut f = std::fs::File::create(out_filename)?;
+        f.write_all(&image_data)?;
+        f.write_all(&vbmeta_bytes)?;
+        f.seek(std::io::SeekFrom::Start((filesize - FOOTER_SIZE) as u64))?;
+        f.write_all(unsafe {
+            std::slice::from_raw_parts(&footer_dest as *const AvbFooter as *const u8, FOOTER_SIZE)
+        })?;
+    }
 
     Ok(())
 }
