@@ -12,7 +12,7 @@ use bindings::AvbFooter;
 use bindings::AvbRSAPublicKeyHeader;
 use bindings::AvbVBMetaImageHeader;
 
-use aws_lc_rs::digest;
+use sha2::Digest;
 
 use num_bigint_dig::BigInt;
 use num_bigint_dig::ExtendedGcd;
@@ -24,16 +24,15 @@ use rsa::RsaPublicKey;
 use rsa::pkcs1::DecodeRsaPrivateKey;
 use rsa::pkcs1v15::SigningKey;
 use rsa::pkcs1v15::VerifyingKey;
-use rsa::pkcs8::EncodePublicKey;
 use rsa::sha2::Sha256;
 use rsa::signature::SignatureEncoding;
-use rsa::signature::Verifier;
 use rsa::signature::hazmat::PrehashSigner;
 use rsa::signature::hazmat::PrehashVerifier;
 use rsa::traits::PublicKeyParts;
+use sha2::Sha512;
 
 use crate::bindings::AVB_FOOTER_MAGIC;
-use crate::bindings::AVB_FOOTER_MAGIC_LEN;
+use crate::bindings::AVB_MAGIC;
 use crate::bindings::AvbDescriptor;
 use crate::bindings::AvbHashDescriptor;
 
@@ -170,14 +169,14 @@ fn convert_to_avb_pubkey(pubkey: &RsaPublicKey) -> Result<Vec<u8>> {
 const FOOTER_SIZE: usize = std::mem::size_of::<AvbFooter>();
 const HEADER_SIZE: usize = std::mem::size_of::<AvbVBMetaImageHeader>();
 const PUBLIC_EXPONENT: u32 = 65537u32;
-const MAX_VBMETA_SIZE: usize = 64 * 1024;
-const MAX_FOOTER_SIZE: usize = 4096;
 const VBMETA_ALIGN: usize = 64;
 
 fn main() -> Result<()> {
+    // Default log level is info. Set RUST_LOG=debug for more logs.
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
     let mut args = std::env::args().skip(1);
-    let filename = args.next().unwrap();
+    let filename = args.next().expect("Please provide a filename.");
     let out_filename = args.next();
     let mut f = std::fs::File::open(&filename)?;
     let filesize = std::fs::metadata(&filename)?.size() as usize;
@@ -200,10 +199,7 @@ fn main() -> Result<()> {
     } else {
         (0, 0)
     };
-    info!(
-        "VBMeta header offset: {} original image size: {}",
-        header_offset, original_image_size
-    );
+    info!("VBMeta header offset: {} original image size: {}", header_offset, original_image_size);
 
     f.seek(std::io::SeekFrom::Start(header_offset))?;
     let mut header_buf = vec![0; HEADER_SIZE];
@@ -213,9 +209,10 @@ fn main() -> Result<()> {
     let mut header = AvbVBMetaImageHeader::default();
     avb_vbmeta_image_header_to_host_byte_order(header_src, &mut header);
 
-    match &header.magic {
-        b"AVB0" => info!("Magic ok."),
-        _ => return Err("VBMeta magic is not valid.".into()),
+    if &header.magic == &AVB_MAGIC[0..4] {
+        info!("Magic ok.");
+    } else {
+        return Err("VBMeta magic is not valid.".into());
     }
 
     const SHA256_ALGOES: [u32; 3] = [
@@ -228,14 +225,6 @@ fn main() -> Result<()> {
         AvbAlgorithmType::AVB_ALGORITHM_TYPE_SHA512_RSA4096 as u32,
         AvbAlgorithmType::AVB_ALGORITHM_TYPE_SHA512_RSA8192 as u32,
     ];
-    let algo_type = header.algorithm_type;
-    let mut hash_context = if SHA256_ALGOES.contains(&algo_type) {
-        digest::Context::new(&digest::SHA256)
-    } else if SHA512_ALGOES.contains(&algo_type) {
-        digest::Context::new(&digest::SHA512)
-    } else {
-        return Err(format!("Unknown algorithm type: {}", algo_type).into());
-    };
 
     // VBMeta = AvbVBMetaImageHeader + Authentication data + Auxiliary data
     // Authentication data = hash + signature
@@ -255,9 +244,19 @@ fn main() -> Result<()> {
 
     let mut message = header_buf[0..HEADER_SIZE].to_vec();
     message.extend(&auxiliary_data);
-    hash_context.update(&message);
-    let hash_calc = hash_context.finish();
-    let hash_calc = hash_calc.as_ref();
+
+    let algo_type = header.algorithm_type;
+    let hash_calc = if SHA256_ALGOES.contains(&algo_type) {
+        let mut hash_context = Sha256::new();
+        hash_context.update(&message);
+        hash_context.finalize()[..].to_vec()
+    } else if SHA512_ALGOES.contains(&algo_type) {
+        let mut hash_context = Sha512::new();
+        hash_context.update(&message);
+        hash_context.finalize()[..].to_vec()
+    } else {
+        return Err(format!("Unknown algorithm type: {}", algo_type).into());
+    };
 
     let hash = &authentication_data
         [header.hash_offset as usize..header.hash_offset as usize + header.hash_size as usize];
@@ -267,9 +266,6 @@ fn main() -> Result<()> {
         info!("Hashes of VBMeta matched");
     }
 
-    let auth_data_size = header.authentication_data_block_size;
-    let pubkey_size = header.public_key_size;
-    let pubkey_offset = header.public_key_offset;
     let public_key_data = &auxiliary_data[header.public_key_offset as usize
         ..header.public_key_offset as usize + header.public_key_size as usize];
     let public_key_header = public_key_data.as_ptr() as *const AvbRSAPublicKeyHeader;
@@ -289,11 +285,11 @@ fn main() -> Result<()> {
     let signature = rsa::pkcs1v15::Signature::try_from(sig_value)?;
     match verifying_key.verify_prehash(hash, &signature) {
         Ok(_) => {
-            info!("Verify Ok");
+            info!("Signature verification Ok");
             vbmeta_signature_correct = true;
         }
         Err(e) => {
-            info!("Verify Failed: {e}");
+            info!("Signature verification Failed: {e}");
         }
     }
     let testkey = if num_bits == 2048 {
@@ -349,7 +345,7 @@ fn main() -> Result<()> {
                 .to_string();
             debug!("Hash descriptor information:");
             debug!("Algorithm: {}", algo_name);
-            debug!("partition name: {}", String::from_utf8(partition_name.to_vec())?
+            debug!("Partition name: {}", String::from_utf8(partition_name.to_vec())?
                     .trim_end_matches('\0')
                     .to_string()
             );
@@ -357,35 +353,38 @@ fn main() -> Result<()> {
             debug!("Digest: {}", hex(digest));
 
             let hash_partition_calc = if original_image_size != 0 {
-                let mut hash_context = if algo_name == "sha256" {
-                    digest::Context::new(&digest::SHA256)
+                let hash_partition_calc = if algo_name == "sha256" {
+                    let mut hash_context = Sha256::new();
+                    hash_context.update(&salt);
+                    hash_context.update(&image_data);
+                    hash_context.finalize()[..].to_vec()
                 } else if algo_name == "sha512" {
-                    digest::Context::new(&digest::SHA512)
+                    let mut hash_context = Sha512::new();
+                    hash_context.update(&salt);
+                    hash_context.update(&image_data);
+                    hash_context.finalize()[..].to_vec()
                 } else {
                     return Err("Unknown digest algorithm".into());
                 };
-                hash_context.update(&salt);
-                hash_context.update(&image_data);
-                let hash_partition_calc = hash_context.finish();
-                let hash_partition_calc = hash_partition_calc.as_ref().to_owned();
                 info!("New partition hash: {}", hex(&hash_partition_calc));
                 if hash_partition_calc == digest {
-                    info!("Partition hash matches");
+                    info!("Partition hashes match");
                     partition_hash_matches = true;
                 } else {
                     info!("Hashes did not match");
                 }
                 hash_partition_calc
             } else {
+                // Hash descriptors in vbmeta.
                 return Err("Not supported now".into());
             };
 
             // Fix up it because many(?) boot modification tools don't fix this. They only patch original_image_size on AvbFooter.
             if hash_dest.image_size != original_image_size {
-                info!("Partition size mismatch in hash descriptor. Fix it.");
+                info!("Partition sizes mismatch in hash descriptor. Fix it.");
                 hash_dest.image_size = original_image_size;
             } else {
-                info!("Partition size matches");
+                info!("Partition sizes match");
                 parititon_size_check = true;
             }
 
@@ -450,15 +449,6 @@ fn main() -> Result<()> {
     let mut new_header_dest = unsafe { std::mem::zeroed::<AvbVBMetaImageHeader>() };
     avb_vbmeta_image_header_to_host_byte_order(&new_header, &mut new_header_dest);
 
-    let algo_type = new_header.algorithm_type;
-    let mut hash_context = if SHA256_ALGOES.contains(&algo_type) {
-        digest::Context::new(&digest::SHA256)
-    } else if SHA512_ALGOES.contains(&algo_type) {
-        digest::Context::new(&digest::SHA512)
-    } else {
-        return Err(format!("Unknown algorithm type: {}", algo_type).into());
-    };
-
     let mut vbmeta_header_bytes = vec![];
     vbmeta_header_bytes.extend_from_slice(unsafe {
         std::slice::from_raw_parts(
@@ -467,13 +457,25 @@ fn main() -> Result<()> {
         )
     });
     // Signature target is VBMeta header + Auxiliary data block.
-    hash_context.update(&vbmeta_header_bytes);
-    hash_context.update(&new_descriptors_data);
-    hash_context.update(&pubkey_bytes);
-    hash_context.update(&auxiliary_pad);
-    let new_hash = hash_context.finish();
-    let new_hash = new_hash.as_ref();
-    let new_signature = signing_key.sign_prehash(new_hash)?.to_bytes();
+    let algo_type = new_header.algorithm_type;
+    let new_hash = if SHA256_ALGOES.contains(&algo_type) {
+        let mut hash_context = Sha256::new();
+        hash_context.update(&vbmeta_header_bytes);
+        hash_context.update(&new_descriptors_data);
+        hash_context.update(&pubkey_bytes);
+        hash_context.update(&auxiliary_pad);
+        hash_context.finalize()[..].to_vec()
+    } else if SHA512_ALGOES.contains(&algo_type) {
+        let mut hash_context = Sha512::new();
+        hash_context.update(&vbmeta_header_bytes);
+        hash_context.update(&new_descriptors_data);
+        hash_context.update(&pubkey_bytes);
+        hash_context.update(&auxiliary_pad);
+        hash_context.finalize()[..].to_vec()
+    } else {
+        return Err(format!("Unknown algorithm type: {}", algo_type).into());
+    };
+    let new_signature = signing_key.sign_prehash(&new_hash)?.to_bytes();
 
     let mut vbmeta_bytes = vbmeta_header_bytes;
     vbmeta_bytes.extend(new_hash);

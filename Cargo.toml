@@ -4,10 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-aws-lc-rs = "1.16.1"
-env_logger = "0.11.9"
+env_filter = { version = "1.0.0", default-features = false }
+env_logger = { version = "0.11.9", default-features = false }
 log = "0.4.29"
-num-bigint-dig = "=0.8.6"
+num-bigint-dig = { version = "0.8", default-features = false }
 num-traits = "*"
-rsa = { version = "0.9.10", features = ["hazmat", "sha1", "sha2"] }
-zerocopy = { version = "0.8.27", features = ["derive", "std"] }
+rsa = { version = "0.9.10", features = ["hazmat", "pem", "sha1", "sha2", "std"], default-features = false }
+sha2 = "0.10.9"

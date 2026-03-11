@@ -1,8 +1,5 @@
 #![allow(non_camel_case_types, non_snake_case, unused)]
 
-#![no_std]
-use zerocopy::{Immutable, IntoBytes, FromBytes, KnownLayout};
-
 pub const AVB_ALIGNMENT_SIZE: u32 = 8;
 pub const AVB_RSA2048_NUM_BYTES: u32 = 256;
 pub const AVB_RSA4096_NUM_BYTES: u32 = 512;
@@ -83,7 +80,7 @@ pub mod AvbDescriptorTag {
     pub const AVB_DESCRIPTOR_TAG_CHAIN_PARTITION: Type = 4;
 }
 #[repr(C, packed)]
-#[derive(Debug, Default, Copy, Clone, FromBytes, Immutable, KnownLayout)]
+#[derive(Debug, Default, Copy, Clone)]
 pub struct AvbDescriptor {
     pub tag: u64,
     pub num_bytes_following: u64,
@@ -163,7 +160,7 @@ impl ::core::ops::BitAndAssign for AvbChainPartitionDescriptorFlags {
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct AvbChainPartitionDescriptorFlags(pub core::ffi::c_uint);
 #[repr(C, packed)]
-#[derive(Debug, Copy, Clone, FromBytes, Immutable, KnownLayout)]
+#[derive(Debug, Copy, Clone)]
 pub struct AvbChainPartitionDescriptor {
     pub parent_descriptor: AvbDescriptor,
     pub rollback_index_location: u32,
@@ -447,7 +444,7 @@ impl ::core::ops::BitAndAssign for AvbHashDescriptorFlags {
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct AvbHashDescriptorFlags(pub core::ffi::c_uint);
 #[repr(C, packed)]
-#[derive(Debug, Copy, Clone, FromBytes, Immutable, KnownLayout)]
+#[derive(Debug, Copy, Clone)]
 pub struct AvbHashDescriptor {
     pub parent_descriptor: AvbDescriptor,
     pub image_size: u64,
@@ -600,7 +597,7 @@ impl ::core::ops::BitAndAssign for AvbHashtreeDescriptorFlags {
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct AvbHashtreeDescriptorFlags(pub core::ffi::c_uint);
 #[repr(C, packed)]
-#[derive(Debug, Copy, Clone, FromBytes, Immutable, KnownLayout)]
+#[derive(Debug, Copy, Clone)]
 pub struct AvbHashtreeDescriptor {
     pub parent_descriptor: AvbDescriptor,
     pub dm_verity_version: u32,
@@ -842,7 +839,7 @@ impl ::core::ops::BitAndAssign for AvbKernelCmdlineFlags {
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct AvbKernelCmdlineFlags(pub core::ffi::c_uint);
 #[repr(C, packed)]
-#[derive(Debug, Default, Copy, Clone, FromBytes, Immutable, KnownLayout)]
+#[derive(Debug, Default, Copy, Clone)]
 pub struct AvbKernelCmdlineDescriptor {
     pub parent_descriptor: AvbDescriptor,
     pub flags: u32,
@@ -1196,7 +1193,7 @@ impl Default for AvbOps {
     }
 }
 #[repr(C, packed)]
-#[derive(Debug, Default, Copy, Clone, FromBytes, Immutable, KnownLayout)]
+#[derive(Debug, Default, Copy, Clone)]
 pub struct AvbPropertyDescriptor {
     pub parent_descriptor: AvbDescriptor,
     pub key_num_bytes: u64,
@@ -1940,7 +1937,7 @@ impl Default for AvbSlotVerifyData {
     }
 }
 #[repr(C, packed)]
-#[derive(Debug, Copy, Clone, FromBytes, Immutable, IntoBytes, KnownLayout)]
+#[derive(Debug, Copy, Clone)]
 pub struct AvbCertPermanentAttributes {
     pub version: u32,
     pub product_root_public_key: [u8; 1032usize],
@@ -2002,7 +1999,7 @@ impl Default for AvbCertPermanentAttributes {
     }
 }
 #[repr(C, packed)]
-#[derive(Debug, Copy, Clone, FromBytes, Immutable, IntoBytes, KnownLayout)]
+#[derive(Debug, Copy, Clone)]
 pub struct AvbCertCertificateSignedData {
     pub version: u32,
     pub public_key: [u8; 1032usize],
@@ -2086,7 +2083,7 @@ impl Default for AvbCertCertificateSignedData {
     }
 }
 #[repr(C, packed)]
-#[derive(Debug, Copy, Clone, FromBytes, Immutable, IntoBytes, KnownLayout)]
+#[derive(Debug, Copy, Clone)]
 pub struct AvbCertCertificate {
     pub signed_data: AvbCertCertificateSignedData,
     pub signature: [u8; 512usize],
@@ -2136,7 +2133,7 @@ impl Default for AvbCertCertificate {
     }
 }
 #[repr(C, packed)]
-#[derive(Debug, Default, Copy, Clone, FromBytes, Immutable, IntoBytes, KnownLayout)]
+#[derive(Debug, Default, Copy, Clone)]
 pub struct AvbCertUnlockChallenge {
     pub version: u32,
     pub product_id_hash: [u8; 32usize],
@@ -2189,7 +2186,7 @@ fn bindgen_test_layout_AvbCertUnlockChallenge() {
     );
 }
 #[repr(C, packed)]
-#[derive(Debug, Copy, Clone, FromBytes, Immutable, IntoBytes, KnownLayout)]
+#[derive(Debug, Copy, Clone)]
 pub struct AvbCertUnlockCredential {
     pub version: u32,
     pub product_intermediate_key_certificate: AvbCertCertificate,
