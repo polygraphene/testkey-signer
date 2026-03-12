@@ -1043,6 +1043,7 @@ def verify_vbmeta_signature(vbmeta_header, vbmeta_blob):
     computed_digest = ha.digest()
 
   if computed_digest != digest_blob:
+    print("Hash not match")
     return False
 
   with decode_public_key(alg_name, pubkey_blob) as pubkey:
@@ -2093,7 +2094,10 @@ class AvbHashDescriptor(AvbDescriptor):
       image_filename = image_containing_descriptor.filename
       image = image_containing_descriptor
     else:
-      image_filename = os.path.join(image_dir, self.partition_name + image_ext)
+      image_filename = image_containing_descriptor.filename
+      image = image_containing_descriptor
+      print("NOTICE:", "Using input file :", image_filename, self.image_size)
+      #image_filename = os.path.join(image_dir, self.partition_name + image_ext)
       image = ImageHandler(image_filename, read_only=True)
     data = image.read(self.image_size)
     ha = hashlib.new(self.hash_algorithm)
@@ -2102,8 +2106,8 @@ class AvbHashDescriptor(AvbDescriptor):
     digest = ha.digest()
     # The digest must match unless there is no digest in the descriptor.
     if self.digest and digest != self.digest:
-      sys.stderr.write('{} digest of {} does not match digest in descriptor\n'.
-                       format(self.hash_algorithm, image_filename))
+      sys.stderr.write('{} digest of {} does not match digest in descriptor: {} (calculated) != {} (in desc) (salt: {})\n'.
+                       format(self.hash_algorithm, image_filename, digest.hex(), self.digest.hex(), self.salt.hex()))
       return False
     print('{}: Successfully verified {} hash of {} for image of {} bytes'
           .format(self.partition_name, self.hash_algorithm, image.filename,
