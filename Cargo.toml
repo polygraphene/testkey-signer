@@ -4,9 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+anyhow = "1.0.102"
+clap = { version = "4.5.60", default-features = false, features = ["derive", "help", "std"] }
 env_filter = { version = "1.0.0", default-features = false }
 env_logger = { version = "0.11.9", default-features = false }
 log = "0.4.29"
+nix = { version = "0.31.2", default-features = false, features = ["ioctl"] }
 num-bigint-dig = { version = "0.8", default-features = false }
 num-traits = "*"
 rsa = { version = "0.9.10", features = ["hazmat", "pem", "sha1", "sha2", "std"], default-features = false }

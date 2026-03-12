@@ -2,8 +2,10 @@ use sha2::Sha256;
 use sha2::Sha512;
 use sha2::Digest;
 
+use anyhow::Result;
+use anyhow::anyhow;
+
 use crate::bindings::AvbAlgorithmType;
-use crate::Result;
 
 const SHA256_ALGOES: [u32; 3] = [
     AvbAlgorithmType::AVB_ALGORITHM_TYPE_SHA256_RSA2048 as u32,
@@ -28,7 +30,7 @@ impl Hasher {
         } else if SHA512_ALGOES.contains(&algo_type) {
             Ok(Hasher::Sha512(Sha512::new()))
         } else {
-            Err(format!("Unknown algorithm type: {}", algo_type).into())
+            Err(anyhow!("Unknown algorithm type: {}", algo_type))
         }
     }
 
@@ -38,7 +40,7 @@ impl Hasher {
         } else if name == "sha512" {
             Ok(Hasher::Sha512(Sha512::new()))
         } else {
-            Err(format!("Unknown digest algorithm: {}", name).into())
+            Err(anyhow!("Unknown digest algorithm: {}", name))
         }
     }
 
@@ -48,7 +50,7 @@ impl Hasher {
         } else if SHA512_ALGOES.contains(&algo_type) {
             Ok(64)
         } else {
-            Err(format!("Unknown algorithm type: {}", algo_type).into())
+            Err(anyhow!("Unknown algorithm type: {}", algo_type))
         }
     }
 

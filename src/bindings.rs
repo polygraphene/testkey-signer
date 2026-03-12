@@ -1,3 +1,5 @@
+// Based on bindgen output of libavb headers.
+
 #![allow(non_camel_case_types, non_snake_case, unused)]
 
 pub const AVB_ALIGNMENT_SIZE: u32 = 8;
