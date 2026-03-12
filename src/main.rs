@@ -677,6 +677,7 @@ mod tests {
         fn new() -> Self {
             let dir = std::env::temp_dir();
             let dir = dir.join("testkey-signer-tmp");
+            let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).expect("Failed to create tempdir");
             Self { dir }
         }
@@ -688,11 +689,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_patch_file() {
-        let tempdir = Tempdir::new();
-
-        let mut f = std::fs::File::create_new(tempdir.dir.join("bootmod.img")).expect("Failed to create bootmod.img");
+    fn prepare_boot_image(tempdir: &Tempdir) -> std::path::PathBuf {
+        let outfile = tempdir.dir.join("bootmod.img");
+        let mut f = std::fs::File::create_new(&outfile).expect("Failed to create bootmod.img");
         let mut data = b"test".to_vec();
         data.extend(vec![0; 4096 * 10 - 4]);
         f.write_all(&data).expect("Failed to write bootmod.img");
@@ -702,7 +701,7 @@ mod tests {
             .arg("tests/avbtool.py")
             .arg("add_hash_footer")
             .arg("--image")
-            .arg(tempdir.dir.join("bootmod.img"))
+            .arg(&outfile)
             .arg("--partition_size")
             .arg((4096 * 30).to_string())
             .arg("--partition_name")
@@ -725,10 +724,19 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
 
+        outfile
+    }
+
+    #[test]
+    fn test_patch_file() {
+        let tempdir = Tempdir::new();
+
+        let bootimg = prepare_boot_image(&tempdir);
+
         let mut f = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
-            .open(tempdir.dir.join("bootmod.img"))
+            .open(&bootimg)
             .expect("Failed to open bootmod.img");
         f.seek(std::io::SeekFrom::Start(2)).expect("Failed to seek");
         f.write_all(b"ch").expect("Failed to write bootmod.img");
@@ -738,7 +746,7 @@ mod tests {
             .arg("tests/avbtool.py")
             .arg("verify_image")
             .arg("--image")
-            .arg(tempdir.dir.join("bootmod.img"))
+            .arg(&bootimg)
             .output()
             .expect("Failed to run avbtool");
 
@@ -751,7 +759,7 @@ mod tests {
 
         run(Args {
             command: Commands::PatchFile {
-                input_filename: tempdir.dir.join("bootmod.img").to_str().unwrap().to_string(),
+                input_filename: bootimg.to_str().unwrap().to_string(),
                 output_filename: Some(tempdir.dir.join("bootmodout.img").to_str().unwrap().to_string()),
             },
             log_level: Some("info".to_string()),
@@ -763,6 +771,8 @@ mod tests {
             .arg("verify_image")
             .arg("--image")
             .arg(tempdir.dir.join("bootmodout.img"))
+            .arg("--key")
+            .arg("testkey_rsa4096.pem")
             .output()
             .expect("Failed to run avbtool");
 
