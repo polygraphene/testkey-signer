@@ -1,5 +1,7 @@
 use std::io::{Read, Write, Seek};
-use anyhow::Result;
+use anyhow::{Result, anyhow};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::os::unix::io::AsRawFd;
 
 pub trait IoDelegate: Read + Write + Seek {
@@ -57,39 +59,103 @@ impl IoDelegate for RealDevice {
     }
 }
 
+#[derive(Clone)]
 pub struct MockDevice {
-    pub data: std::io::Cursor<Vec<u8>>,
+    pub data: Arc<Mutex<std::io::Cursor<Vec<u8>>>>,
 }
 
 impl MockDevice {
     pub fn new(data: Vec<u8>) -> Self {
-        Self { data: std::io::Cursor::new(data) }
+        Self {
+            data: Arc::new(Mutex::new(std::io::Cursor::new(data))),
+        }
+    }
+
+    pub fn into_inner(&self) -> Vec<u8> {
+        self.data.lock().unwrap().get_ref().clone()
     }
 }
 
 impl Read for MockDevice {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.data.read(buf)
+        self.data.lock().unwrap().read(buf)
     }
 }
 
 impl Write for MockDevice {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.data.write(buf)
+        self.data.lock().unwrap().write(buf)
     }
     fn flush(&mut self) -> std::io::Result<()> {
-        self.data.flush()
+        self.data.lock().unwrap().flush()
     }
 }
 
 impl Seek for MockDevice {
     fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
-        self.data.seek(pos)
+        self.data.lock().unwrap().seek(pos)
     }
 }
 
 impl IoDelegate for MockDevice {
     fn get_size(&mut self) -> Result<usize> {
-        Ok(self.data.get_ref().len())
+        Ok(self.data.lock().unwrap().get_ref().len())
+    }
+}
+
+pub trait Environment {
+    fn get_prop(&self, name: &str) -> Result<String>;
+    fn open_device(&self, name: &str, is_device: bool, write: bool) -> Result<Box<dyn IoDelegate>>;
+}
+
+pub struct RealEnvironment;
+
+impl Environment for RealEnvironment {
+    #[cfg(target_os = "android")]
+    fn get_prop(&self, name: &str) -> Result<String> {
+        unsafe extern "C" {
+            fn __system_property_get(name: *const u8, value: *mut u8) -> i32;
+        }
+
+        let mut value = vec![0u8; 1024];
+        let len = unsafe { __system_property_get((name.to_string() + "\0").as_ptr(), value.as_mut_ptr()) } as usize;
+        if len == 0 {
+            Err(anyhow!("Property {name} not found"))
+        } else {
+            value.resize(len, 0);
+            Ok(String::from_utf8(value)?)
+        }
+    }
+
+    #[cfg(not(target_os = "android"))]
+    fn get_prop(&self, _name: &str) -> Result<String> {
+        Err(anyhow!("Not running on Android"))
+    }
+
+    fn open_device(&self, name: &str, is_device: bool, write: bool) -> Result<Box<dyn IoDelegate>> {
+        let mut file_opts = std::fs::OpenOptions::new();
+        file_opts.read(true);
+        if write {
+            file_opts.write(true);
+        }
+        let f = file_opts.open(name)?;
+        Ok(Box::new(RealDevice::new(f, is_device)))
+    }
+}
+
+pub struct MockEnvironment {
+    pub props: HashMap<String, String>,
+    pub devices: std::sync::Mutex<HashMap<String, MockDevice>>,
+}
+
+impl Environment for MockEnvironment {
+    fn get_prop(&self, name: &str) -> Result<String> {
+        self.props.get(name).cloned().ok_or_else(|| anyhow!("Property {name} not found in MockEnvironment"))
+    }
+
+    fn open_device(&self, name: &str, _is_device: bool, _write: bool) -> Result<Box<dyn IoDelegate>> {
+        let devices = self.devices.lock().unwrap();
+        let device = devices.get(name).ok_or_else(|| anyhow!("Device {name} not found in MockEnvironment"))?.clone();
+        Ok(Box::new(device))
     }
 }

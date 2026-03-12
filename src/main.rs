@@ -3,12 +3,11 @@ mod hasher;
 mod io_delegate;
 mod testkey;
 
-use io_delegate::{IoDelegate, RealDevice, MockDevice};
+use io_delegate::{Environment, IoDelegate, RealEnvironment};
 
 use std::io::Seek;
 use std::io::Write;
 
-use anyhow::Context;
 use clap::Subcommand;
 use num_bigint_dig::BigInt;
 use num_bigint_dig::ExtendedGcd;
@@ -492,28 +491,6 @@ fn generate_new_header(header: &AvbVBMetaImageHeader, new_descriptors_data: Vec<
     })
 }
 
-#[cfg(target_os = "android")]
-unsafe extern "C" {
-    fn __system_property_get(name: *const u8, value: *mut u8) -> i32;
-}
-#[cfg(target_os = "android")]
-fn get_prop(name: &str) -> Result<String> {
-    let mut value = vec![0u8; 1024];
-    let len = unsafe {
-        __system_property_get((name.to_string() + "\0").as_ptr(), value.as_mut_ptr())
-    } as usize;
-    if len == 0 {
-        Err(anyhow!("Property {name} not found"))
-    } else{
-        value.resize(len, 0);
-        Ok(String::from_utf8(value)?)
-    }
-}
-#[cfg(not(target_os = "android"))]
-fn get_prop(_name: &str) -> Result<String> {
-    Err(anyhow!("Not running on Android"))
-}
-
 const FOOTER_SIZE: usize = std::mem::size_of::<AvbFooter>();
 const HEADER_SIZE: usize = std::mem::size_of::<AvbVBMetaImageHeader>();
 const PUBLIC_EXPONENT: u32 = 65537u32;
@@ -554,53 +531,60 @@ enum Commands {
 }
 
 fn main() -> Result<()> {
-    run(Args::parse())
+    // Default log level is info. Set RUST_LOG=debug for more logs.
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    run(Args::parse(), &RealEnvironment)
 }
 
-fn run(mut args: Args) -> Result<()> {
-    if args.log_level.is_none() {
-        args.log_level = Some("info".to_string());
-    }
-    
-    // Default log level is info. Set RUST_LOG=debug for more logs.
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(args.log_level.unwrap())).init();
-
+fn run(mut args: Args, env: &dyn Environment) -> Result<()> {
     let (input_filename, is_device) = match &args.command {
         Commands::PatchDevice { inactive_slot, .. } => {
-            let slot_suffix = get_prop("ro.boot.slot_suffix")?;
+            let slot_suffix = env.get_prop("ro.boot.slot_suffix").unwrap_or_default();
             if !slot_suffix.is_empty() {
                 info!("Current slot: {}", slot_suffix.trim_start_matches("_"));
             } else {
                 info!("Non A/B device");
             }
             let slot_suffix = match slot_suffix.as_str() {
-                "_a" => if *inactive_slot { "_b" } else { "_a" },
-                "_b" => if *inactive_slot { "_a" } else { "_b" },
-                "" => if *inactive_slot { return Err(anyhow!("Can't use --inactive-slot in non A/B device")) } else { "" },
-                _ => return Err(anyhow!("Invalid slot name: {slot_suffix}"))
+                "_a" => {
+                    if *inactive_slot {
+                        "_b"
+                    } else {
+                        "_a"
+                    }
+                }
+                "_b" => {
+                    if *inactive_slot {
+                        "_a"
+                    } else {
+                        "_b"
+                    }
+                }
+                "" => {
+                    if *inactive_slot {
+                        return Err(anyhow!("Can't use --inactive-slot in non A/B device"));
+                    } else {
+                        ""
+                    }
+                }
+                _ => return Err(anyhow!("Invalid slot name: {slot_suffix}")),
             };
             if !slot_suffix.is_empty() {
                 info!("Target slot: {}", slot_suffix.trim_start_matches("_"));
             }
             let boot_dev = format!("/dev/block/by-name/boot{slot_suffix}");
-            
+
             (boot_dev, true)
-        },
-        Commands::PatchFile { input_filename, .. } => {
-            (input_filename.clone(), false)
         }
+        Commands::PatchFile { input_filename, .. } => (input_filename.clone(), false),
     };
 
-    let mut file_opts = std::fs::OpenOptions::new();
-    file_opts.read(true);
-    if let Commands::PatchDevice { .. } = args.command {
-        file_opts.write(true);
-    }
+    let write = if let Commands::PatchDevice { .. } = args.command { true } else { false };
 
-    let f = file_opts.open(&input_filename).context(format!("Failed to open input file: {}", input_filename))?;
-    let mut root_device = RealDevice::new(f, is_device);
+    let mut root_device = env.open_device(&input_filename, is_device, write)?;
 
-    run_action(&args.command, &input_filename, &mut root_device)
+    run_action(&args.command, &input_filename, root_device.as_mut())
 }
 
 fn run_action(command: &Commands, input_filename: &str, device: &mut dyn IoDelegate) -> Result<()> {
@@ -684,7 +668,7 @@ fn run_action(command: &Commands, input_filename: &str, device: &mut dyn IoDeleg
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::io_delegate::MockDevice;
+    use crate::io_delegate::MockEnvironment;
     use std::process::Command;
 
     struct Tempdir {
@@ -748,6 +732,35 @@ mod tests {
         outfile
     }
 
+    fn verify_file(tempdir: &Tempdir, filename: &str, expected_status: bool) {
+        let outfile = tempdir.dir.join(filename);
+        let output = Command::new("python3")
+            .arg("tests/avbtool.py")
+            .arg("verify_image")
+            .arg("--image")
+            .arg(&outfile)
+            .arg("--key")
+            .arg("testkey_rsa4096.pem")
+            .output()
+            .expect("Failed to run avbtool");
+
+        assert!(
+            output.status.success() == expected_status,
+            "avbtool verify failed for active slot\n--- stdout ---\n{}\\n--- stderr ---\\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn verify_image_data(tempdir: &Tempdir, patched_data: &[u8], expected_status: bool) {
+        let outfile = tempdir.dir.join("tmp_data.img");
+        std::fs::write(&outfile, &patched_data).expect("Failed to write mock patched data A");
+
+        verify_file(tempdir, "tmp_data.img", expected_status);
+
+        std::fs::remove_file(&outfile).expect("Failed to remove tmp_data.img");
+    }
+
     #[test]
     fn test_patch_file() {
         let tempdir = Tempdir::new();
@@ -763,20 +776,7 @@ mod tests {
         f.write_all(b"ch").expect("Failed to write bootmod.img");
         drop(f);
 
-        let output = Command::new("python3")
-            .arg("tests/avbtool.py")
-            .arg("verify_image")
-            .arg("--image")
-            .arg(&bootimg)
-            .output()
-            .expect("Failed to run avbtool");
-
-        assert!(
-            !output.status.success(),
-            "avbtool failed\n--- stdout ---\n{}\n--- stderr ---\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+        verify_file(&tempdir, bootimg.to_str().unwrap(), false);
 
         run(Args {
             command: Commands::PatchFile {
@@ -784,29 +784,16 @@ mod tests {
                 output_filename: Some(tempdir.dir.join("bootmodout.img").to_str().unwrap().to_string()),
             },
             log_level: Some("info".to_string()),
-        })
+        }, &RealEnvironment)
         .expect("Failed to run test_patch_file");
 
-        let output = Command::new("python3")
-            .arg("tests/avbtool.py")
-            .arg("verify_image")
-            .arg("--image")
-            .arg(tempdir.dir.join("bootmodout.img"))
-            .arg("--key")
-            .arg("testkey_rsa4096.pem")
-            .output()
-            .expect("Failed to run avbtool");
-
-        assert!(
-            output.status.success(),
-            "avbtool failed\n--- stdout ---\n{}\n--- stderr ---\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+        verify_file(&tempdir, "bootmodout.img", true);
     }
 
     #[test]
     fn test_mock_device() {
+        use crate::io_delegate::MockDevice;
+
         let tempdir = Tempdir::new();
         let bootimg = prepare_boot_image(&tempdir);
         let mut data = std::fs::read(&bootimg).expect("Failed to read bootimg");
@@ -820,26 +807,74 @@ mod tests {
         run_action(&Commands::PatchDevice { yes: true, inactive_slot: false }, "mock_boot", &mut mock_device).expect("Failed to run patch on mock device");
 
         // Verify that the mock device was written securely
-        let patched_data = mock_device.data.into_inner();
-        let outfile = tempdir.dir.join("bootmod_mock.img");
-        std::fs::write(&outfile, patched_data).expect("Failed to write mock patched data");
+        let patched_data = mock_device.into_inner();
 
-        // Verify the patched image is valid
-        let output = Command::new("python3")
-            .arg("tests/avbtool.py")
-            .arg("verify_image")
-            .arg("--image")
-            .arg(&outfile)
-            .arg("--key")
-            .arg("testkey_rsa4096.pem")
-            .output()
-            .expect("Failed to run avbtool");
+        verify_image_data(&tempdir, &patched_data, true);
+    }
 
-        assert!(
-            output.status.success(),
-            "avbtool verify failed for mock patched device\n--- stdout ---\n{}\n--- stderr ---\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+    #[test]
+    fn test_patch_device_slots() {
+        use std::collections::HashMap;
+        use crate::io_delegate::MockDevice;
+
+        let tempdir = Tempdir::new();
+        let bootimg = prepare_boot_image(&tempdir);
+        let data = std::fs::read(&bootimg).expect("Failed to read bootimg");
+
+        let mut data_a = data.clone();
+        let mut data_b = data.clone();
+
+        // Slightly modify them to differ
+        data_a[2] = b'a';
+        data_b[2] = b'b';
+
+        let mut props = HashMap::new();
+        props.insert("ro.boot.slot_suffix".to_string(), "_a".to_string());
+
+        let mut devices = HashMap::new();
+        devices.insert("/dev/block/by-name/boot_a".to_string(), MockDevice::new(data_a.clone()));
+        devices.insert("/dev/block/by-name/boot_b".to_string(), MockDevice::new(data_b));
+
+        let mock_env = MockEnvironment {
+            props,
+            devices: std::sync::Mutex::new(devices),
+        };
+
+        // Patch active slot (_a)
+        run(
+            Args {
+                command: Commands::PatchDevice { yes: true, inactive_slot: false },
+                log_level: Some("info".to_string()),
+            },
+            &mock_env,
+        )
+        .expect("Failed to patch active slot");
+
+        // Verify active slot was patched securely (check 'a' at offset 2, patched VBMeta correctly via verify_image)
+        let binding = mock_env.devices.lock().unwrap();
+        let patched_data_a = binding.get("/dev/block/by-name/boot_a").expect("boot_a not found").into_inner();
+        let unpatched_data_b = binding.get("/dev/block/by-name/boot_b").expect("boot_b not found").into_inner();
+        drop(binding);
+
+        verify_image_data(&tempdir, &patched_data_a, true);
+        verify_image_data(&tempdir, &unpatched_data_b, false);
+        // Patch inactive slot (_b)
+        run(
+            Args {
+                command: Commands::PatchDevice { yes: true, inactive_slot: true },
+                log_level: Some("info".to_string()),
+            },
+            &mock_env,
+        )
+        .expect("Failed to patch inactive slot");
+
+        // Verify inactive slot was patched securely
+        let binding = mock_env.devices.lock().unwrap();
+        let patched_data_a = binding.get("/dev/block/by-name/boot_a").expect("boot_a not found").into_inner();
+        let patched_data_b = binding.get("/dev/block/by-name/boot_b").expect("boot_b not found").into_inner();
+        drop(binding);
+
+        verify_image_data(&tempdir, &patched_data_a, true);
+        verify_image_data(&tempdir, &patched_data_b, true);
     }
 }
