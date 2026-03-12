@@ -509,8 +509,8 @@ fn get_prop(name: &str) -> Result<String> {
     }
 }
 #[cfg(not(target_os = "android"))]
-fn get_prop(_name: &str) -> String {
-    "".to_string()
+fn get_prop(_name: &str) -> Result<String> {
+    Err(anyhow!("Not running on Android"))
 }
 
 const FOOTER_SIZE: usize = std::mem::size_of::<AvbFooter>();
@@ -549,7 +549,10 @@ enum Commands {
 }
 
 fn main() -> Result<()> {
-    let mut args = Args::parse();
+    run(Args::parse())
+}
+
+fn run(mut args: Args) -> Result<()> {
     if args.log_level.is_none() {
         args.log_level = Some("info".to_string());
     }
@@ -637,7 +640,7 @@ fn main() -> Result<()> {
             f.seek(std::io::SeekFrom::Start((filesize - FOOTER_SIZE) as u64))?;
             f.write_all(unsafe { std::slice::from_raw_parts(&footer as *const AvbFooter as *const u8, FOOTER_SIZE) })?;
 
-            warn!("Patching done.");
+            warn!("Successfully patched {input_filename}");
         },
         Commands::PatchFile { input_filename: _, output_filename } => {
             if let Some(output_filename) = output_filename {
@@ -660,4 +663,114 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+mod tests {
+    use super::*;
+    use std::process::Command;
+
+    struct Tempdir {
+        dir: std::path::PathBuf,
+    }
+
+    impl Tempdir {
+        fn new() -> Self {
+            let dir = std::env::temp_dir();
+            let dir = dir.join("testkey-signer-tmp");
+            std::fs::create_dir_all(&dir).expect("Failed to create tempdir");
+            Self { dir }
+        }
+    }
+
+    impl Drop for Tempdir {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.dir).expect("Failed to remove tempdir");
+        }
+    }
+
+    #[test]
+    fn test_patch_file() {
+        let tempdir = Tempdir::new();
+
+        let mut f = std::fs::File::create_new(tempdir.dir.join("bootmod.img")).expect("Failed to create bootmod.img");
+        let mut data = b"test".to_vec();
+        data.extend(vec![0; 4096 * 10 - 4]);
+        f.write_all(&data).expect("Failed to write bootmod.img");
+        drop(f);
+
+        let output = Command::new("python3")
+            .arg("tests/avbtool.py")
+            .arg("add_hash_footer")
+            .arg("--image")
+            .arg(tempdir.dir.join("bootmod.img"))
+            .arg("--partition_size")
+            .arg((4096 * 30).to_string())
+            .arg("--partition_name")
+            .arg("boot")
+            .arg("--algorithm")
+            .arg("SHA256_RSA4096")
+            .arg("--key")
+            .arg("testkey_rsa4096.pem")
+            .arg("--rollback_index")
+            .arg("123")
+            .arg("--prop")
+            .arg("abc:def")
+            .output()
+            .expect("Failed to run avbtool");
+
+        assert!(
+            output.status.success(),
+            "avbtool failed\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(tempdir.dir.join("bootmod.img"))
+            .expect("Failed to open bootmod.img");
+        f.seek(std::io::SeekFrom::Start(2)).expect("Failed to seek");
+        f.write_all(b"ch").expect("Failed to write bootmod.img");
+        drop(f);
+
+        let output = Command::new("python3")
+            .arg("tests/avbtool.py")
+            .arg("verify_image")
+            .arg("--image")
+            .arg(tempdir.dir.join("bootmod.img"))
+            .output()
+            .expect("Failed to run avbtool");
+
+        assert!(
+            !output.status.success(),
+            "avbtool failed\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        run(Args {
+            command: Commands::PatchFile {
+                input_filename: tempdir.dir.join("bootmod.img").to_str().unwrap().to_string(),
+                output_filename: Some(tempdir.dir.join("bootmodout.img").to_str().unwrap().to_string()),
+            },
+            log_level: Some("info".to_string()),
+        })
+        .expect("Failed to run test_patch_file");
+
+        let output = Command::new("python3")
+            .arg("tests/avbtool.py")
+            .arg("verify_image")
+            .arg("--image")
+            .arg(tempdir.dir.join("bootmodout.img"))
+            .output()
+            .expect("Failed to run avbtool");
+
+        assert!(
+            output.status.success(),
+            "avbtool failed\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
