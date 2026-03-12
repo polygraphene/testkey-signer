@@ -1,12 +1,12 @@
 mod bindings;
-mod testkey;
 mod hasher;
+mod io_delegate;
+mod testkey;
 
-use std::io::Read;
+use io_delegate::{IoDelegate, RealDevice, MockDevice};
+
 use std::io::Seek;
 use std::io::Write;
-use std::os::unix::fs::MetadataExt;
-use std::os::unix::io::AsRawFd;
 
 use anyhow::Context;
 use clap::Subcommand;
@@ -26,7 +26,7 @@ use rsa::signature::hazmat::PrehashSigner;
 use rsa::signature::hazmat::PrehashVerifier;
 use rsa::traits::PublicKeyParts;
 
-use log::{debug, error, info, warn};
+use log::{debug, info, warn};
 use clap::Parser;
 use anyhow::Result;
 use anyhow::anyhow;
@@ -195,11 +195,12 @@ fn get_key_bits(key_bits: KeyBits) -> usize {
     }
 }
 
+#[allow(dead_code)]
 fn get_key_bytes(key_bits: KeyBits) -> usize {
     get_key_bits(key_bits) / 8
 }
 
-fn parse_vbmeta(mut f: std::fs::File, filesize: usize) -> Result<ParsedHeaders> {
+fn parse_vbmeta(f: &mut dyn IoDelegate, filesize: usize) -> Result<ParsedHeaders> {
     let (header_offset, original_image_size) = if filesize >= FOOTER_SIZE {
         f.seek(std::io::SeekFrom::End(-(FOOTER_SIZE as i64)))?;
         let mut buf = vec![0; FOOTER_SIZE];
@@ -522,7 +523,7 @@ const VBMETA_ALIGN: usize = 64;
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None, after_help = "Example:
  # Patch current slot boot partition
- testkey-signer patch-device
+ testkey-signer patch-device [--inactive-slot]
  # Just verify file
  testkey-signer patch-file boot.img
  # Patch file
@@ -543,6 +544,10 @@ enum Commands {
         /// Run on interactive mode if not specified with confirmation message before writing to devices.
         #[arg(short = 'y')]
         yes: bool,
+
+        /// Patch inactive slot instead of current slot.
+        #[arg(short = 'i')]
+        inactive_slot: bool,
     },
     #[command(arg_required_else_help = true)]
     PatchFile { input_filename: String, output_filename: Option<String> },
@@ -559,11 +564,24 @@ fn run(mut args: Args) -> Result<()> {
     
     // Default log level is info. Set RUST_LOG=debug for more logs.
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(args.log_level.unwrap())).init();
-    
+
     let (input_filename, is_device) = match &args.command {
-        Commands::PatchDevice { .. } => {
+        Commands::PatchDevice { inactive_slot, .. } => {
             let slot_suffix = get_prop("ro.boot.slot_suffix")?;
-            info!("Current slot: {}", slot_suffix.trim_start_matches("_"));
+            if !slot_suffix.is_empty() {
+                info!("Current slot: {}", slot_suffix.trim_start_matches("_"));
+            } else {
+                info!("Non A/B device");
+            }
+            let slot_suffix = match slot_suffix.as_str() {
+                "_a" => if *inactive_slot { "_b" } else { "_a" },
+                "_b" => if *inactive_slot { "_a" } else { "_b" },
+                "" => if *inactive_slot { return Err(anyhow!("Can't use --inactive-slot in non A/B device")) } else { "" },
+                _ => return Err(anyhow!("Invalid slot name: {slot_suffix}"))
+            };
+            if !slot_suffix.is_empty() {
+                info!("Target slot: {}", slot_suffix.trim_start_matches("_"));
+            }
             let boot_dev = format!("/dev/block/by-name/boot{slot_suffix}");
             
             (boot_dev, true)
@@ -572,25 +590,28 @@ fn run(mut args: Args) -> Result<()> {
             (input_filename.clone(), false)
         }
     };
-    
-    let f = std::fs::File::open(&input_filename).context(format!("Failed to open input file: {}", input_filename))?;
-    let filesize = if is_device {
-        const BLKGETSIZE64_CODE: u8 = 0x12; // Defined in linux/fs.h
-        const BLKGETSIZE64_SEQ: u8 = 114;
-        ioctl_read!(ioctl_blkgetsize64, BLKGETSIZE64_CODE, BLKGETSIZE64_SEQ, u64);
-        let mut size64 = 0u64;
-        let size64_ptr = &mut size64 as *mut u64;
-        
-        unsafe {
-            ioctl_blkgetsize64(f.as_raw_fd(), size64_ptr)?;
-        }
-        size64 as usize
-    }else{
-        std::fs::metadata(&input_filename).context(format!("Failed to get filesize of input file: {}", input_filename))?.size() as usize
-    };
-    
+
+    let mut file_opts = std::fs::OpenOptions::new();
+    file_opts.read(true);
+    if let Commands::PatchDevice { .. } = args.command {
+        file_opts.write(true);
+    }
+
+    let f = file_opts.open(&input_filename).context(format!("Failed to open input file: {}", input_filename))?;
+    let mut root_device = RealDevice::new(f, is_device);
+
+    run_action(&args.command, &input_filename, &mut root_device)
+}
+
+fn run_action(command: &Commands, input_filename: &str, device: &mut dyn IoDelegate) -> Result<()> {
+    let filesize = device.get_size()?;
+
+    if filesize == 0 {
+        return Err(anyhow!("Cannot get filesize of {input_filename}"));
+    }
+
     info!("Parsing VBMeta for {input_filename}.");
-    let parsed = parse_vbmeta(f, filesize)?;
+    let parsed = parse_vbmeta(device, filesize)?;
     
     let f = |b| if b { "OK" } else { "NG" };
     info!("VBMeta Hash: {}", f(parsed.vbmeta_hashes_match));
@@ -609,13 +630,13 @@ fn run(mut args: Args) -> Result<()> {
         KeyBits::Key4096 => TESTKEY_4096,
     };
     let testkey = RsaPrivateKey::from_pkcs1_pem(String::from_utf8(testkey.to_vec())?.as_str())?;
-    
+
     let new_vbmeta = generate_new_header(&parsed.header, parsed.new_descriptors_data, parsed.algo_type, &testkey, parsed.original_image_size)?;
-    
-    match args.command {
-        Commands::PatchDevice { yes } => {
+
+    match command {
+        Commands::PatchDevice { yes, .. } => {
             info!("Patching device");
-            if !yes {
+            if !*yes {
                 print!("Really patch partitions? (y/n)");
                 std::io::stdout().flush()?;
                 let mut input = String::new();
@@ -629,32 +650,27 @@ fn run(mut args: Args) -> Result<()> {
                 return Err(anyhow!("No footer was generated"));
             };
 
-            let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .read(true)
-            .open(&input_filename)?;
-
-            f.seek(std::io::SeekFrom::Start(footer.vbmeta_offset.to_be()))?;
-            f.write_all(&new_vbmeta.vbmeta_bytes)?;
+            device.seek(std::io::SeekFrom::Start(footer.vbmeta_offset.to_be()))?;
+            device.write_all(&new_vbmeta.vbmeta_bytes)?;
             
-            f.seek(std::io::SeekFrom::Start((filesize - FOOTER_SIZE) as u64))?;
-            f.write_all(unsafe { std::slice::from_raw_parts(&footer as *const AvbFooter as *const u8, FOOTER_SIZE) })?;
+            device.seek(std::io::SeekFrom::Start((filesize - FOOTER_SIZE) as u64))?;
+            device.write_all(unsafe { std::slice::from_raw_parts(&footer as *const AvbFooter as *const u8, FOOTER_SIZE) })?;
 
             warn!("Successfully patched {input_filename}");
         },
         Commands::PatchFile { input_filename: _, output_filename } => {
             if let Some(output_filename) = output_filename {
                 warn!("Writing output file: {output_filename}");
-                let mut f = std::fs::File::create(output_filename)?;
+                let mut f_out = std::fs::File::create(output_filename)?;
                 match new_vbmeta.footer {
                     Some(footer) => {
-                        f.write_all(&parsed.image_data.expect("No image data was loaded"))?;
-                        f.write_all(&new_vbmeta.vbmeta_bytes)?;
-                        f.seek(std::io::SeekFrom::Start((filesize - FOOTER_SIZE) as u64))?;
-                        f.write_all(unsafe { std::slice::from_raw_parts(&footer as *const AvbFooter as *const u8, FOOTER_SIZE) })?;
+                        f_out.write_all(&parsed.image_data.expect("No image data was loaded"))?;
+                        f_out.write_all(&new_vbmeta.vbmeta_bytes)?;
+                        f_out.seek(std::io::SeekFrom::Start((filesize - FOOTER_SIZE) as u64))?;
+                        f_out.write_all(unsafe { std::slice::from_raw_parts(&footer as *const AvbFooter as *const u8, FOOTER_SIZE) })?;
                     }
                     None => {
-                        f.write_all(&new_vbmeta.vbmeta_bytes)?;
+                        f_out.write_all(&new_vbmeta.vbmeta_bytes)?;
                     }
                 }
                 warn!("Patching done.");
@@ -665,18 +681,23 @@ fn run(mut args: Args) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 mod tests {
     use super::*;
+    use crate::io_delegate::MockDevice;
     use std::process::Command;
 
     struct Tempdir {
         dir: std::path::PathBuf,
     }
 
+    static TEMP_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
     impl Tempdir {
         fn new() -> Self {
+            let id = TEMP_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let dir = std::env::temp_dir();
-            let dir = dir.join("testkey-signer-tmp");
+            let dir = dir.join(format!("testkey-signer-tmp-{}", id));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).expect("Failed to create tempdir");
             Self { dir }
@@ -779,6 +800,44 @@ mod tests {
         assert!(
             output.status.success(),
             "avbtool failed\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn test_mock_device() {
+        let tempdir = Tempdir::new();
+        let bootimg = prepare_boot_image(&tempdir);
+        let mut data = std::fs::read(&bootimg).expect("Failed to read bootimg");
+
+        data[2] = b'c';
+        data[3] = b'h';
+
+        let mut mock_device = MockDevice::new(data);
+
+        // Run patch action using the mock device instead of actual file
+        run_action(&Commands::PatchDevice { yes: true, inactive_slot: false }, "mock_boot", &mut mock_device).expect("Failed to run patch on mock device");
+
+        // Verify that the mock device was written securely
+        let patched_data = mock_device.data.into_inner();
+        let outfile = tempdir.dir.join("bootmod_mock.img");
+        std::fs::write(&outfile, patched_data).expect("Failed to write mock patched data");
+
+        // Verify the patched image is valid
+        let output = Command::new("python3")
+            .arg("tests/avbtool.py")
+            .arg("verify_image")
+            .arg("--image")
+            .arg(&outfile)
+            .arg("--key")
+            .arg("testkey_rsa4096.pem")
+            .output()
+            .expect("Failed to run avbtool");
+
+        assert!(
+            output.status.success(),
+            "avbtool verify failed for mock patched device\n--- stdout ---\n{}\n--- stderr ---\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
