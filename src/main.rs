@@ -42,6 +42,7 @@ extern crate nix;
 use crate::bindings::AvbAlgorithmType;
 use crate::bindings::AvbDescriptorTag;
 use crate::bindings::AvbFooter;
+use crate::bindings::AvbPropertyDescriptor;
 use crate::bindings::AvbRSAPublicKeyHeader;
 use crate::bindings::AvbVBMetaImageHeader;
 use crate::bindings::AVB_FOOTER_MAGIC;
@@ -141,6 +142,22 @@ fn avb_hash_descriptor_bytes_to_host_byte_order(src: &[u8], dest: &mut AvbHashDe
     }
     let src_ptr = src.as_ptr() as *const AvbHashDescriptor;
     avb_hash_descriptor_to_host_byte_order(unsafe { &*src_ptr }, dest);
+    Ok(())
+}
+
+fn avb_property_descriptor_to_host_byte_order(src: &AvbPropertyDescriptor, dest: &mut AvbPropertyDescriptor) {
+    dest.parent_descriptor.tag = src.parent_descriptor.tag.to_be();
+    dest.parent_descriptor.num_bytes_following = src.parent_descriptor.num_bytes_following.to_be();
+    dest.key_num_bytes = src.key_num_bytes.to_be();
+    dest.value_num_bytes = src.value_num_bytes.to_be();
+}
+
+fn avb_property_descriptor_bytes_to_host_byte_order(src: &[u8], dest: &mut AvbPropertyDescriptor) -> Result<()> {
+    if src.len() < std::mem::size_of::<AvbPropertyDescriptor>() {
+        return Err(anyhow!("Invalid descriptor"));
+    }
+    let src_ptr = src.as_ptr() as *const AvbPropertyDescriptor;
+    avb_property_descriptor_to_host_byte_order(unsafe { &*src_ptr }, dest);
     Ok(())
 }
 
@@ -536,11 +553,7 @@ fn generate_new_header(header: &AvbVBMetaImageHeader, new_descriptors_data: Vec<
         new_header.signature_offset = 0;
         new_header.signature_size = 0;
     }
-    let pubkey_bytes = if let Some(key) = &key {
-        convert_to_avb_pubkey(&key.to_public_key())?
-    } else {
-        vec![]
-    };
+    let pubkey_bytes = if let Some(key) = &key { convert_to_avb_pubkey(&key.to_public_key())? } else { vec![] };
 
     new_header.authentication_data_block_size = new_header.signature_offset + new_header.signature_size;
     let authentication_pad = vec![0; pad_size(new_header.authentication_data_block_size as usize, VBMETA_ALIGN)];
@@ -605,15 +618,63 @@ fn generate_new_header(header: &AvbVBMetaImageHeader, new_descriptors_data: Vec<
     })
 }
 
+fn patch_boot_spl(descriptors_data: &mut Vec<u8>, boot_spl: &str) -> Result<()> {
+    let mut pos = 0;
+    let mut new_descriptors_data = vec![];
+    while pos < descriptors_data.len() {
+        let mut descriptor = AvbDescriptor::new_zeroed();
+        avb_descriptor_bytes_to_host_byte_order(&descriptors_data[pos..pos + AVB_DESCRIPTOR_SIZE], &mut descriptor)?;
+
+        let tag = descriptor.tag;
+        let num_bytes_following = descriptor.num_bytes_following as usize;
+        if pos + AVB_DESCRIPTOR_SIZE + num_bytes_following > descriptors_data.len() {
+            return Err(anyhow!("Invalid descriptor"));
+        }
+
+        if tag == AvbDescriptorTag::AVB_DESCRIPTOR_TAG_PROPERTY as u64 {
+            let mut prop_descriptor = AvbPropertyDescriptor::new_zeroed();
+            avb_property_descriptor_bytes_to_host_byte_order(&descriptors_data[pos..pos + AVB_DESCRIPTOR_SIZE + num_bytes_following], &mut prop_descriptor)?;
+            let key_num_bytes = prop_descriptor.key_num_bytes as usize;
+            let value_num_bytes = prop_descriptor.value_num_bytes as usize;
+            let mut cur_pos = pos + std::mem::size_of::<AvbPropertyDescriptor>();
+            let key = String::from_utf8(descriptors_data[cur_pos..cur_pos + key_num_bytes].to_vec())?;
+            cur_pos += key_num_bytes + 1;
+            let value = String::from_utf8(descriptors_data[cur_pos..cur_pos + value_num_bytes].to_vec())?;
+            if key == "com.android.build.boot.security_patch" {
+                info!("Patching boot security patch from {} to {}", value, boot_spl);
+                prop_descriptor.value_num_bytes = boot_spl.len() as u64;
+                prop_descriptor.parent_descriptor.num_bytes_following = (std::mem::size_of::<AvbPropertyDescriptor>() - AVB_DESCRIPTOR_SIZE + key_num_bytes + 1 + boot_spl.len() + 1) as u64;
+                prop_descriptor.parent_descriptor.num_bytes_following += pad_size(prop_descriptor.parent_descriptor.num_bytes_following as usize, DESCRIPTOR_ALIGN) as u64;
+                let mut dest = AvbPropertyDescriptor::new_zeroed();
+                avb_property_descriptor_to_host_byte_order(&prop_descriptor, &mut dest);
+                new_descriptors_data.extend_from_slice(dest.as_bytes());
+                new_descriptors_data.extend_from_slice(key.as_bytes());
+                new_descriptors_data.push(0);
+                new_descriptors_data.extend_from_slice(boot_spl.as_bytes());
+                new_descriptors_data.push(0);
+                pad_right(&mut new_descriptors_data, DESCRIPTOR_ALIGN);
+            } else {
+                new_descriptors_data.extend_from_slice(&descriptors_data[pos..pos + AVB_DESCRIPTOR_SIZE + num_bytes_following]);
+            }
+        } else {
+            new_descriptors_data.extend_from_slice(&descriptors_data[pos..pos + AVB_DESCRIPTOR_SIZE + num_bytes_following]);
+        }
+        pos += AVB_DESCRIPTOR_SIZE + num_bytes_following;
+    }
+    std::mem::swap(descriptors_data, &mut new_descriptors_data);
+
+    Ok(())
+}
+
 /// Read VBMeta from device or files and patch it.
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None, after_help = "Example:
  # Patch current slot boot partition
- testkey-signer patch-device [--inactive-slot] [--dry-run]
+ testkey-signer patch-device [--inactive-slot] [--dry-run] [--boot-spl 2025-03-05]
  # Just verify file
  testkey-signer patch-single-file boot.img
  # Patch file
- testkey-signer patch-single-file boot.img bootout.img")]
+ testkey-signer patch-single-file boot.img bootout.img [--boot-spl 2025-03-05]")]
 struct Args {
     #[command(subcommand)]
     command: Commands,
@@ -638,9 +699,22 @@ enum Commands {
         /// Don't write to devices, just show what will be done.
         #[arg(short = 'n', long = "dry-run")]
         dry_run: bool,
+
+        /// Patch SPL for boot partition. Format: YYYY-MM-DD
+        #[arg(short = 'b', long = "boot-spl")]
+        boot_spl: Option<String>,
     },
     #[command(arg_required_else_help = true)]
-    PatchSingleFile { input_filename: String, output_filename: Option<String> },
+    PatchSingleFile {
+        /// Input filename.
+        input_filename: String,
+        /// Optional output filename. If not specified, output is not generated.
+        output_filename: Option<String>,
+
+        /// Patch SPL for boot partition. Format: YYYY-MM-DD.
+        #[arg(short = 'b', long = "boot-spl")]
+        boot_spl: Option<String>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -652,16 +726,21 @@ fn main() -> Result<()> {
 
 fn run(args: Args, env: &dyn Environment) -> Result<()> {
     match &args.command {
-        Commands::PatchDevice { inactive_slot, yes, dry_run } => {
-            return run_patch_device(env, *inactive_slot, *yes, *dry_run);
+        Commands::PatchDevice {
+            inactive_slot,
+            yes,
+            dry_run,
+            boot_spl,
+        } => {
+            return run_patch_device(env, *inactive_slot, *yes, *dry_run, boot_spl.clone());
         }
-        Commands::PatchSingleFile { input_filename, output_filename } => {
-            return run_patch_single_file(env, input_filename, output_filename);
+        Commands::PatchSingleFile { input_filename, output_filename, boot_spl } => {
+            return run_patch_single_file(env, input_filename, output_filename, boot_spl.clone());
         }
     };
 }
 
-fn run_patch_single_file(env: &dyn Environment, input_filename: &str, output_filename: &Option<String>) -> Result<()> {
+fn run_patch_single_file(env: &dyn Environment, input_filename: &str, output_filename: &Option<String>, boot_spl: Option<String>) -> Result<()> {
     let mut device = env.open_device(input_filename, false, false)?;
     let filesize = device.get_size()?;
 
@@ -670,7 +749,10 @@ fn run_patch_single_file(env: &dyn Environment, input_filename: &str, output_fil
     }
 
     info!("Parsing VBMeta for {input_filename}.");
-    let parsed = parse_vbmeta(device.as_mut(), filesize, false, None)?;
+    let mut parsed = parse_vbmeta(device.as_mut(), filesize, false, None)?;
+    if let Some(boot_spl) = boot_spl {
+        patch_boot_spl(&mut parsed.new_descriptors_data, &boot_spl)?;
+    }
 
     parsed.print_result();
     if parsed.is_valid() {
@@ -722,12 +804,12 @@ fn get_test_key(key_num_bits: Option<KeyBits>) -> Result<Option<RsaPrivateKey>> 
                 KeyBits::Key4096 => TESTKEY_4096,
             };
             Ok(Some(RsaPrivateKey::from_pkcs1_pem(String::from_utf8(testkey.to_vec())?.as_str())?))
-        },
+        }
         None => Ok(None),
     }
 }
 
-fn run_patch_device(env: &dyn Environment, inactive_slot: bool, yes: bool, dry_run: bool) -> Result<()> {
+fn run_patch_device(env: &dyn Environment, inactive_slot: bool, yes: bool, dry_run: bool, boot_spl: Option<String>) -> Result<()> {
     let slot_suffix = env.get_prop("ro.boot.slot_suffix").unwrap_or_default();
     if !slot_suffix.is_empty() {
         info!("Current slot: {}", slot_suffix.trim_start_matches("_"));
@@ -778,6 +860,9 @@ fn run_patch_device(env: &dyn Environment, inactive_slot: bool, yes: bool, dry_r
         if let Some(parent_vbmeta_hash_descriptor) = &mut parsed.parent_vbmeta_hash_descriptor {
             replace_hash_descriptors.insert(partition.name.clone(), std::mem::take(parent_vbmeta_hash_descriptor));
         }
+        if let Some(boot_spl) = &boot_spl {
+            patch_boot_spl(&mut parsed.new_descriptors_data, boot_spl)?;
+        }
         parsed_vbmeta_list.push((partition, parsed));
     }
 
@@ -790,7 +875,10 @@ fn run_patch_device(env: &dyn Environment, inactive_slot: bool, yes: bool, dry_r
     }
 
     info!("Parsing VBMeta for {vbmeta_device}.");
-    let parsed = parse_vbmeta(device.as_mut(), filesize, true, Some(&replace_hash_descriptors)).context(format!("Failed to parse VBMeta for {vbmeta_device}"))?;
+    let mut parsed = parse_vbmeta(device.as_mut(), filesize, true, Some(&replace_hash_descriptors)).context(format!("Failed to parse VBMeta for {vbmeta_device}"))?;
+    if let Some(boot_spl) = &boot_spl {
+        patch_boot_spl(&mut parsed.new_descriptors_data, boot_spl)?;
+    }
 
     for (partition, parsed) in &parsed_vbmeta_list {
         info!("Partition {}", partition.name);
@@ -907,6 +995,10 @@ mod tests {
             .arg("123")
             .arg("--prop")
             .arg("abc:def")
+            .arg("--prop")
+            .arg("com.android.build.boot.security_patch:2026-01-01")
+            .arg("--prop")
+            .arg("com.android.build.boot.os_version:15")
             .output()
             .expect("Failed to run avbtool");
 
@@ -1073,6 +1165,38 @@ mod tests {
         std::fs::remove_file(&init_bootimg_file).expect("Failed to remove init_boot.img");
     }
 
+    fn get_boot_spl(tempdir: &Tempdir, data: &[u8]) -> Result<String> {
+        let tmpfile = tempdir.dir.join("tmp.img");
+        let mut f = std::fs::File::create(&tmpfile).expect("Failed to create tmp.img");
+        f.write_all(data).expect("Failed to write tmp.img");
+        drop(f);
+
+        let output = Command::new("python3")
+            .arg("tests/avbtool.py")
+            .arg("info_image")
+            .arg("--image")
+            .arg(&tmpfile)
+            .output()
+            .expect("Failed to run avbtool");
+
+        assert!(
+            output.status.success(),
+            "avbtool info_image failed\n--- stdout ---\n{}\\n--- stderr ---\\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let output = String::from_utf8_lossy(&output.stdout);
+        for line in output.lines() {
+            let line = line.trim();
+            const PREFIX: &str = "Prop: com.android.build.boot.security_patch -> '";
+            if line.starts_with(PREFIX) {
+                return Ok(line[PREFIX.len()..line.len() - 1].to_string());
+            }
+        }
+        Err(anyhow!("Prop not found"))
+    }
+
     #[test]
     fn test_patch_file() {
         let tempdir = Tempdir::new();
@@ -1091,6 +1215,7 @@ mod tests {
                 command: Commands::PatchSingleFile {
                     input_filename: bootimg.to_str().unwrap().to_string(),
                     output_filename: Some(tempdir.dir.join("bootmodout.img").to_str().unwrap().to_string()),
+                    boot_spl: None,
                 },
                 log_level: Some("info".to_string()),
             },
@@ -1119,6 +1244,7 @@ mod tests {
                 command: Commands::PatchSingleFile {
                     input_filename: bootimg.to_str().unwrap().to_string(),
                     output_filename: Some(tempdir.dir.join("init_boot_mod_out.img").to_str().unwrap().to_string()),
+                    boot_spl: None,
                 },
                 log_level: Some("info".to_string()),
             },
@@ -1179,7 +1305,6 @@ mod tests {
         init_boot_data_a[0..init_boot_mod_data.len()].copy_from_slice(init_boot_mod_data);
         init_boot_data_b[0..init_boot_mod_data.len()].copy_from_slice(init_boot_mod_data);
 
-
         let mut props = HashMap::new();
         props.insert("ro.boot.slot_suffix".to_string(), "_a".to_string());
 
@@ -1199,7 +1324,7 @@ mod tests {
         // Patch active slot (_a)
         run(
             Args {
-                command: Commands::PatchDevice { yes: true, inactive_slot: false },
+                command: Commands::PatchDevice { yes: true, inactive_slot: false, dry_run: false, boot_spl: Some("Modified boot spl".to_string()) },
                 log_level: Some("info".to_string()),
             },
             &mock_env,
@@ -1218,10 +1343,11 @@ mod tests {
 
         verify_partition_set(&tempdir, &patched_vbmeta_data_a, &patched_boot_data_a, &patched_init_boot_data_a, true);
         verify_partition_set(&tempdir, &unpatched_vbmeta_data_b, &unpatched_boot_data_b, &unpatched_init_boot_data_b, false);
+        assert_eq!(get_boot_spl(&tempdir, &patched_boot_data_a).expect("Failed to get boot spl"), "Modified boot spl");
         // Patch inactive slot (_b)
         run(
             Args {
-                command: Commands::PatchDevice { yes: true, inactive_slot: true },
+                command: Commands::PatchDevice { yes: true, inactive_slot: true, dry_run: false, boot_spl: Some("Modified boot spl 2".to_string()) },
                 log_level: Some("info".to_string()),
             },
             &mock_env,
@@ -1240,5 +1366,6 @@ mod tests {
 
         verify_partition_set(&tempdir, &patched_vbmeta_data_a, &patched_boot_data_a, &patched_init_boot_data_a, true);
         verify_partition_set(&tempdir, &patched_vbmeta_data_b, &patched_boot_data_b, &patched_init_boot_data_b, true);
+        assert_eq!(get_boot_spl(&tempdir, &patched_boot_data_b).expect("Failed to get boot spl"), "Modified boot spl 2");
     }
 }
