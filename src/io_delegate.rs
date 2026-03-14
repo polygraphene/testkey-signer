@@ -6,6 +6,7 @@ use std::os::unix::io::AsRawFd;
 
 pub trait IoDelegate: Read + Write + Seek {
     fn get_size(&mut self) -> Result<usize>;
+    fn set_writable(&mut self) -> Result<()>;
 }
 
 pub struct RealDevice {
@@ -57,6 +58,16 @@ impl IoDelegate for RealDevice {
             Ok(self.file.metadata()?.len() as usize)
         }
     }
+
+    fn set_writable(&mut self) -> Result<()> {
+        const BLKROSET_CODE: u8 = 0x12;
+        const BLKROSET_SEQ: u8 = 93;
+        ioctl_write_ptr_bad!(ioctl_blkroset, request_code_none!(BLKROSET_CODE, BLKROSET_SEQ), i32);
+        unsafe {
+            ioctl_blkroset(self.file.as_raw_fd(), &0)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -101,12 +112,17 @@ impl IoDelegate for MockDevice {
     fn get_size(&mut self) -> Result<usize> {
         Ok(self.data.lock().unwrap().get_ref().len())
     }
+
+    fn set_writable(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 pub trait Environment {
     fn get_prop(&self, name: &str) -> Result<String>;
     fn open_device(&self, name: &str, is_device: bool, write: bool) -> Result<Box<dyn IoDelegate>>;
     fn device_exists(&self, name: &str) -> bool;
+    fn set_writable(&self, name: &str) -> Result<()>;
 }
 
 pub struct RealEnvironment;
@@ -148,6 +164,13 @@ impl Environment for RealEnvironment {
         file_opts.read(true);
         file_opts.open(name).is_ok()
     }
+
+    fn set_writable(&self, name: &str) -> Result<()> {
+        let mut file_opts = std::fs::OpenOptions::new();
+        file_opts.read(true);
+        let f = file_opts.open(name)?;
+        RealDevice::new(f, true).set_writable()
+    }
 }
 
 pub struct MockEnvironment {
@@ -172,5 +195,9 @@ impl Environment for MockEnvironment {
     fn device_exists(&self, name: &str) -> bool {
         let devices = self.devices.lock().unwrap();
         devices.contains_key(name)
+    }
+
+    fn set_writable(&self, _name: &str) -> Result<()> {
+        Ok(())
     }
 }

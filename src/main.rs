@@ -273,6 +273,7 @@ struct ParsedHeaders {
     vbmeta_signatures_match: Option<bool>,
     new_descriptors_data: Vec<u8>,
     parent_vbmeta_hash_descriptor: Option<Vec<u8>>,
+    incorrect_hash_descriptor_num: Option<usize>,
 }
 
 impl ParsedHeaders {
@@ -423,6 +424,7 @@ fn parse_vbmeta(f: &mut dyn IoDelegate, filesize: usize, is_vbmeta: bool, replac
     let mut pos = 0;
     let mut new_descriptors_data = vec![];
     let mut parent_vbmeta_hash_descriptor = None;
+    let mut incorrect_hash_descriptor_num = 0;
     while pos < descriptors_data.len() {
         let mut descriptor = AvbDescriptor::new_zeroed();
         avb_descriptor_bytes_to_host_byte_order(&descriptors_data[pos..pos + AVB_DESCRIPTOR_SIZE], &mut descriptor)?;
@@ -496,6 +498,9 @@ fn parse_vbmeta(f: &mut dyn IoDelegate, filesize: usize, is_vbmeta: bool, replac
                             info!("Replacing hash descriptors for {partition_name_str} in vbmeta partition buffer.");
                             trace!("{}", hexdump(new_hash_desc));
                             new_descriptors_data.extend_from_slice(new_hash_desc);
+                            if new_hash_desc != &descriptors_data[pos..pos + AVB_DESCRIPTOR_SIZE + num_bytes_following as usize] {
+                                incorrect_hash_descriptor_num += 1;
+                            }
                         }
                     }
                 }
@@ -529,6 +534,7 @@ fn parse_vbmeta(f: &mut dyn IoDelegate, filesize: usize, is_vbmeta: bool, replac
         vbmeta_signatures_match,
         new_descriptors_data,
         parent_vbmeta_hash_descriptor,
+        incorrect_hash_descriptor_num: if replace_hash_descriptors.is_some() { Some(incorrect_hash_descriptor_num) } else { None },
     })
 }
 
@@ -886,7 +892,9 @@ fn run_patch_device(env: &dyn Environment, inactive_slot: bool, yes: bool, dry_r
     }
     info!("Partition vbmeta");
     parsed.print_result();
-    if parsed.is_valid() && parsed_vbmeta_list.iter().all(|(_, parsed)| parsed.is_valid()) {
+    let parent_descriptors_ok = parsed.incorrect_hash_descriptor_num.expect("Should have incorrect_hash_descriptor_num") == replace_hash_descriptors.len();
+    info!("Parent descriptors ok: {}", parent_descriptors_ok);
+    if parsed.is_valid() && parsed_vbmeta_list.iter().all(|(_, parsed)| parsed.is_valid()) && boot_spl.is_none() && parent_descriptors_ok {
         info!("Hash and signature are all okay. So no need to re-sign. Exit.");
         return Ok(());
     }
@@ -912,6 +920,7 @@ fn run_patch_device(env: &dyn Environment, inactive_slot: bool, yes: bool, dry_r
 
     let new_vbmeta = generate_new_header(&parsed.header, parsed.new_descriptors_data, testkey, parsed.partition_info.as_ref().map(|p| p.original_image_size))?;
 
+    env.set_writable(&vbmeta_device)?;
     let mut device_write = env.open_device(&vbmeta_device, true, true)?;
 
     device_write.write_all(&new_vbmeta.vbmeta_bytes)?;
@@ -925,6 +934,7 @@ fn run_patch_device(env: &dyn Environment, inactive_slot: bool, yes: bool, dry_r
         let Some(footer) = new_vbmeta.footer else {
             return Err(anyhow!("No footer was generated"));
         };
+        env.set_writable(&partition.path)?;
         let mut device_write = env.open_device(&partition.path, true, true)?;
         let filesize = device_write.get_size()?;
         if filesize == 0 {
