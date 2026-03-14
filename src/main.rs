@@ -775,7 +775,9 @@ fn run_patch_device(env: &dyn Environment, inactive_slot: bool, yes: bool, dry_r
         }
         info!("Parsing VBMeta for {}", partition.path);
         let mut parsed = parse_vbmeta(device.as_mut(), filesize, false, None).context(format!("Failed to parse VBMeta for {}", partition.path))?;
-        replace_hash_descriptors.insert(partition.name.clone(), parsed.new_descriptors_data.clone());
+        if let Some(parent_vbmeta_hash_descriptor) = &mut parsed.parent_vbmeta_hash_descriptor {
+            replace_hash_descriptors.insert(partition.name.clone(), std::mem::take(parent_vbmeta_hash_descriptor));
+        }
         parsed_vbmeta_list.push((partition, parsed));
     }
 
