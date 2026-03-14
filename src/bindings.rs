@@ -2,6 +2,9 @@
 
 #![allow(non_camel_case_types, non_snake_case, unused)]
 
+#![no_std]
+use zerocopy::{Immutable, IntoBytes, FromBytes, KnownLayout};
+
 pub const AVB_ALIGNMENT_SIZE: u32 = 8;
 pub const AVB_RSA2048_NUM_BYTES: u32 = 256;
 pub const AVB_RSA4096_NUM_BYTES: u32 = 512;
@@ -82,7 +85,7 @@ pub mod AvbDescriptorTag {
     pub const AVB_DESCRIPTOR_TAG_CHAIN_PARTITION: Type = 4;
 }
 #[repr(C, packed)]
-#[derive(Debug, Default, Copy, Clone)]
+#[derive(Debug, Default, Copy, Clone, FromBytes, IntoBytes, Immutable, KnownLayout)]
 pub struct AvbDescriptor {
     pub tag: u64,
     pub num_bytes_following: u64,
@@ -162,7 +165,7 @@ impl ::core::ops::BitAndAssign for AvbChainPartitionDescriptorFlags {
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct AvbChainPartitionDescriptorFlags(pub core::ffi::c_uint);
 #[repr(C, packed)]
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, FromBytes, IntoBytes, Immutable, KnownLayout)]
 pub struct AvbChainPartitionDescriptor {
     pub parent_descriptor: AvbDescriptor,
     pub rollback_index_location: u32,
@@ -275,7 +278,7 @@ pub enum AvbAlgorithmType {
     _AVB_ALGORITHM_NUM_TYPES = 7,
 }
 #[repr(C, packed)]
-#[derive(Debug, Default, Copy, Clone)]
+#[derive(Debug, Default, Copy, Clone, FromBytes, IntoBytes, Immutable, KnownLayout)]
 pub struct AvbRSAPublicKeyHeader {
     pub key_num_bits: u32,
     pub n0inv: u32,
@@ -317,7 +320,7 @@ fn bindgen_test_layout_AvbRSAPublicKeyHeader() {
     );
 }
 #[repr(C, packed)]
-#[derive(Debug, Default, Copy, Clone)]
+#[derive(Debug, Default, Copy, Clone, FromBytes, IntoBytes, Immutable, KnownLayout)]
 pub struct AvbFooter {
     pub magic: [u8; 4usize],
     pub version_major: u32,
@@ -446,7 +449,7 @@ impl ::core::ops::BitAndAssign for AvbHashDescriptorFlags {
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct AvbHashDescriptorFlags(pub core::ffi::c_uint);
 #[repr(C, packed)]
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, FromBytes, IntoBytes, Immutable, KnownLayout)]
 pub struct AvbHashDescriptor {
     pub parent_descriptor: AvbDescriptor,
     pub image_size: u64,
@@ -599,7 +602,7 @@ impl ::core::ops::BitAndAssign for AvbHashtreeDescriptorFlags {
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct AvbHashtreeDescriptorFlags(pub core::ffi::c_uint);
 #[repr(C, packed)]
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, FromBytes, IntoBytes, Immutable, KnownLayout)]
 pub struct AvbHashtreeDescriptor {
     pub parent_descriptor: AvbDescriptor,
     pub dm_verity_version: u32,
@@ -841,7 +844,7 @@ impl ::core::ops::BitAndAssign for AvbKernelCmdlineFlags {
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct AvbKernelCmdlineFlags(pub core::ffi::c_uint);
 #[repr(C, packed)]
-#[derive(Debug, Default, Copy, Clone)]
+#[derive(Debug, Default, Copy, Clone, FromBytes, IntoBytes, Immutable, KnownLayout)]
 pub struct AvbKernelCmdlineDescriptor {
     pub parent_descriptor: AvbDescriptor,
     pub flags: u32,
@@ -1195,7 +1198,7 @@ impl Default for AvbOps {
     }
 }
 #[repr(C, packed)]
-#[derive(Debug, Default, Copy, Clone)]
+#[derive(Debug, Default, Copy, Clone, FromBytes, IntoBytes, Immutable, KnownLayout)]
 pub struct AvbPropertyDescriptor {
     pub parent_descriptor: AvbDescriptor,
     pub key_num_bytes: u64,
@@ -1291,7 +1294,7 @@ unsafe extern "C" {
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct AvbVBMetaImageFlags(pub core::ffi::c_uint);
 #[repr(C, packed)]
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, FromBytes, IntoBytes, Immutable, KnownLayout)]
 pub struct AvbVBMetaImageHeader {
     pub magic: [u8; 4usize],
     pub required_libavb_version_major: u32,

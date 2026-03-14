@@ -14,6 +14,7 @@ num-bigint-dig = { version = "0.8", default-features = false }
 num-traits = "*"
 rsa = { version = "0.9.10", features = ["hazmat", "pem", "sha1", "sha2", "std"], default-features = false }
 sha2 = "0.10.9"
+zerocopy = { version = "0.8.42", features = ["derive", "std"] }
 
 [profile.release]
 strip = true

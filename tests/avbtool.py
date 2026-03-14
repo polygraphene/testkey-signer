@@ -1733,7 +1733,7 @@ class AvbPropertyDescriptor(AvbDescriptor):
     return ret
 
   def verify(self, image_dir, image_ext, expected_chain_partitions_map,
-             image_containing_descriptor, accept_zeroed_hashtree):
+             image_containing_descriptor, accept_zeroed_hashtree, use_partition_name):
     """Verifies contents of the descriptor - used in verify_image sub-command.
 
     Arguments:
@@ -2075,7 +2075,7 @@ class AvbHashDescriptor(AvbDescriptor):
     return ret
 
   def verify(self, image_dir, image_ext, expected_chain_partitions_map,
-             image_containing_descriptor, accept_zeroed_hashtree):
+             image_containing_descriptor, accept_zeroed_hashtree, use_partition_name):
     """Verifies contents of the descriptor - used in verify_image sub-command.
 
     Arguments:
@@ -2094,10 +2094,12 @@ class AvbHashDescriptor(AvbDescriptor):
       image_filename = image_containing_descriptor.filename
       image = image_containing_descriptor
     else:
-      image_filename = image_containing_descriptor.filename
-      image = image_containing_descriptor
-      print("NOTICE:", "Using input file :", image_filename, self.image_size)
-      #image_filename = os.path.join(image_dir, self.partition_name + image_ext)
+      if use_partition_name:
+        image_filename = os.path.join(image_dir, self.partition_name + image_ext)
+        print("NOTICE:", "Using partition name file :", self.partition_name + image_ext, self.image_size)
+      else:
+        image_filename = image_containing_descriptor.filename
+        print("NOTICE:", "Using input file :", image_filename, self.image_size)
       image = ImageHandler(image_filename, read_only=True)
     data = image.read(self.image_size)
     ha = hashlib.new(self.hash_algorithm)
@@ -2305,7 +2307,7 @@ class AvbChainPartitionDescriptor(AvbDescriptor):
     return ret
 
   def verify(self, image_dir, image_ext, expected_chain_partitions_map,
-             image_containing_descriptor, accept_zeroed_hashtree):
+             image_containing_descriptor, accept_zeroed_hashtree, use_partition_name):
     """Verifies contents of the descriptor - used in verify_image sub-command.
 
     Arguments:
@@ -2915,7 +2917,7 @@ class Avb(object):
       print_certificate(psk)
 
   def verify_image(self, image_filename, key_path, expected_chain_partitions,
-                   follow_chain_partitions, accept_zeroed_hashtree, expected_key = None):
+                   follow_chain_partitions, accept_zeroed_hashtree, use_partition_name, expected_key = None):
     """Implements the 'verify_image' command.
 
     Arguments:
@@ -3010,7 +3012,7 @@ class Avb(object):
               .format(desc.partition_name, desc.rollback_index_location,
                       hashlib.sha1(desc.public_key).hexdigest()))
       elif not desc.verify(image_dir, image_ext, expected_chain_partitions_map,
-                           image, accept_zeroed_hashtree):
+                           image, accept_zeroed_hashtree, use_partition_name):
         raise AvbError('Error verifying descriptor.')
       # Honor --follow_chain_partitions - add '--' to make the output more
       # readable.
@@ -3020,7 +3022,7 @@ class Avb(object):
         chained_image_filename = os.path.join(image_dir,
                                               desc.partition_name + image_ext)
         self.verify_image(chained_image_filename, key_path, None, False,
-                          accept_zeroed_hashtree, desc.public_key)
+                          accept_zeroed_hashtree, use_partition_name, desc.public_key)
 
   def print_partition_digests(self, image_filename, output, as_json):
     """Implements the 'print_partition_digests' command.
@@ -5424,6 +5426,10 @@ class AvbTool(object):
         '--accept_zeroed_hashtree',
         help=('Accept images where the hashtree or FEC data is zeroed out'),
         action='store_true')
+    sub_parser.add_argument(
+        '--use_partition_name',
+        help=('Use [partition name].img for verification of hash descriptors.'),
+        action='store_true')
     sub_parser.set_defaults(func=self.verify_image)
 
     sub_parser = subparsers.add_parser(
@@ -5840,7 +5846,8 @@ Please use '--hash_algorithm sha256'.
     self.avb.verify_image(args.image.name, args.key,
                           args.expected_chain_partition,
                           args.follow_chain_partitions,
-                          args.accept_zeroed_hashtree)
+                          args.accept_zeroed_hashtree,
+                          args.use_partition_name)
 
   def print_partition_digests(self, args):
     """Implements the 'print_partition_digests' sub-command."""

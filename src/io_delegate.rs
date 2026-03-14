@@ -106,6 +106,7 @@ impl IoDelegate for MockDevice {
 pub trait Environment {
     fn get_prop(&self, name: &str) -> Result<String>;
     fn open_device(&self, name: &str, is_device: bool, write: bool) -> Result<Box<dyn IoDelegate>>;
+    fn device_exists(&self, name: &str, is_device: bool) -> bool;
 }
 
 pub struct RealEnvironment;
@@ -141,6 +142,15 @@ impl Environment for RealEnvironment {
         let f = file_opts.open(name)?;
         Ok(Box::new(RealDevice::new(f, is_device)))
     }
+
+    fn device_exists(&self, name: &str, is_device: bool) -> bool {
+        let mut file_opts = std::fs::OpenOptions::new();
+        file_opts.read(true);
+        if is_device {
+            file_opts.write(true);
+        }
+        file_opts.open(name).is_ok()
+    }
 }
 
 pub struct MockEnvironment {
@@ -155,7 +165,13 @@ impl Environment for MockEnvironment {
 
     fn open_device(&self, name: &str, _is_device: bool, _write: bool) -> Result<Box<dyn IoDelegate>> {
         let devices = self.devices.lock().unwrap();
-        let device = devices.get(name).ok_or_else(|| anyhow!("Device {name} not found in MockEnvironment"))?.clone();
+        let mut device = devices.get(name).ok_or_else(|| anyhow!("Device {name} not found in MockEnvironment"))?.clone();
+        device.seek(std::io::SeekFrom::Start(0))?;
         Ok(Box::new(device))
+    }
+
+    fn device_exists(&self, name: &str, _is_device: bool) -> bool {
+        let devices = self.devices.lock().unwrap();
+        devices.contains_key(name)
     }
 }
