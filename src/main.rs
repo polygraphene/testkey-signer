@@ -892,7 +892,7 @@ fn run_patch_device(env: &dyn Environment, inactive_slot: bool, yes: bool, dry_r
     }
     info!("Partition vbmeta");
     parsed.print_result();
-    let parent_descriptors_ok = parsed.incorrect_hash_descriptor_num.expect("Should have incorrect_hash_descriptor_num") == replace_hash_descriptors.len();
+    let parent_descriptors_ok = parsed.incorrect_hash_descriptor_num.expect("Should have incorrect_hash_descriptor_num") == 0;
     info!("Parent descriptors ok: {}", parent_descriptors_ok);
     if parsed.is_valid() && parsed_vbmeta_list.iter().all(|(_, parsed)| parsed.is_valid()) && boot_spl.is_none() && parent_descriptors_ok {
         info!("Hash and signature are all okay. So no need to re-sign. Exit.");
