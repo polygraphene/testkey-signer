@@ -1,9 +1,30 @@
 // Based on bindgen output of libavb headers.
 
 #![allow(non_camel_case_types, non_snake_case, unused)]
-
 #![no_std]
-use zerocopy::{Immutable, IntoBytes, FromBytes, KnownLayout};
+use std::mem::size_of;
+
+use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout};
+
+use anyhow::Result;
+use anyhow::anyhow;
+
+use log::info;
+use log::warn;
+use log::error;
+use log::debug;
+
+use crate::io_delegate::IoDelegate;
+use crate::pad_right;
+use crate::padding_size;
+
+pub const FOOTER_SIZE: usize = size_of::<AvbFooter>();
+const HEADER_SIZE: usize = size_of::<AvbVBMetaImageHeader>();
+const AVB_DESCRIPTOR_SIZE: usize = size_of::<AvbDescriptor>();
+const HASH_DESCRIPTOR_SIZE: usize = size_of::<AvbHashDescriptor>();
+pub const PUBLIC_EXPONENT: u32 = 65537u32;
+pub const VBMETA_ALIGN: usize = 64;
+const DESCRIPTOR_ALIGN: usize = 8;
 
 pub const AVB_ALIGNMENT_SIZE: u32 = 8;
 pub const AVB_RSA2048_NUM_BYTES: u32 = 256;
@@ -124,6 +145,21 @@ fn bindgen_test_layout_AvbDescriptor() {
             stringify!(num_bytes_following)
         )
     );
+}
+impl AvbDescriptor {
+    pub fn from_bytes(src: &[u8]) -> Result<Self> {
+        if src.len() < AVB_DESCRIPTOR_SIZE {
+            return Err(anyhow!("Invalid descriptor size"));
+        }
+        let mut descriptor = Self::new_zeroed();
+        Self::to_host_byte_order(unsafe { &*(src.as_ptr() as *const Self) }, &mut descriptor);
+        Ok(descriptor)
+    }
+
+    fn to_host_byte_order(&self, dest: &mut Self) {
+        dest.tag = self.tag.to_be();
+        dest.num_bytes_following = self.num_bytes_following.to_be();
+    }
 }
 pub type AvbDescriptorForeachFunc = ::core::option::Option<
     unsafe extern "C" fn(
@@ -319,6 +355,58 @@ fn bindgen_test_layout_AvbRSAPublicKeyHeader() {
         )
     );
 }
+impl AvbRSAPublicKeyHeader {
+    pub fn from_bytes(src: &[u8]) -> Result<Self> {
+        let mut dest = Self::new_zeroed();
+        Self::ref_from_bytes(&src[0..size_of::<Self>()])
+            .map_err(|f| anyhow!("Invalid public key header: {}", f))?
+            .to_host_byte_order(&mut dest);
+        Ok(dest)
+    }
+
+    pub fn to_be_bytes(&self) -> Vec<u8> {
+        let mut dest = Self::new_zeroed();
+        self.to_host_byte_order(&mut dest);
+        dest.as_bytes().to_vec()
+    }
+
+    fn to_host_byte_order(&self, dest: &mut Self) {
+        dest.key_num_bits = self.key_num_bits.to_be();
+        dest.n0inv = self.n0inv.to_be();
+    }
+}
+
+#[derive(Default)]
+pub struct AvbRSAPublicKey {
+    pub header: AvbRSAPublicKeyHeader,
+    pub modulus: Vec<u8>,
+    pub rr: Vec<u8>,
+}
+impl AvbRSAPublicKey {
+    pub fn from_bytes(src: &[u8]) -> Result<Self> {
+        let header = AvbRSAPublicKeyHeader::from_bytes(src)?;
+        let modulus_size = header.key_num_bits as usize / 8;
+        let rr_size = header.key_num_bits as usize / 8;
+        if src.len() < size_of::<AvbRSAPublicKeyHeader>() + modulus_size + rr_size {
+            return Err(anyhow!("Invalid public key"));
+        }
+        let mut offset = size_of::<AvbRSAPublicKeyHeader>();
+        let modulus = src[offset..offset + modulus_size].to_vec();
+        offset += modulus_size;
+        let rr = src[offset..offset + rr_size].to_vec();
+        Ok(Self { header, modulus, rr })
+    }
+
+    pub fn to_be_bytes(&self) -> Vec<u8> {
+        let mut bytes = vec![];
+        bytes.extend_from_slice(&self.header.to_be_bytes());
+        bytes.extend_from_slice(&self.modulus);
+        bytes.extend_from_slice(&self.rr);
+        bytes
+    }
+}
+
+
 #[repr(C, packed)]
 #[derive(Debug, Default, Copy, Clone, FromBytes, IntoBytes, Immutable, KnownLayout)]
 pub struct AvbFooter {
@@ -414,6 +502,48 @@ fn bindgen_test_layout_AvbFooter() {
             stringify!(reserved)
         )
     );
+}
+impl AvbFooter {
+    pub fn from_file(f: &mut dyn IoDelegate) -> Result<Option<Self>> {
+        let mut footer_bytes = vec![0u8; FOOTER_SIZE];
+        f.seek(std::io::SeekFrom::End(-(FOOTER_SIZE as i64)))?;
+        f.read_exact(&mut footer_bytes)?;
+
+        Ok(Self::from_bytes(&footer_bytes)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Option<Self>> {
+        if bytes.len() < FOOTER_SIZE {
+            return Err(anyhow!("Invalid footer size"));
+        }
+        let mut footer = Self::new_zeroed();
+        Self::to_host_byte_order(unsafe { &*(bytes.as_ptr() as *const Self) }, &mut footer);
+        if footer.magic != AVB_FOOTER_MAGIC[0..4] {
+            return Ok(None);
+        }
+        Ok(Some(footer))
+    }
+
+    pub fn to_be_bytes(&self) -> Vec<u8> {
+        let mut dest = Self::new_zeroed();
+        self.to_host_byte_order(&mut dest);
+        dest.as_bytes().to_vec()
+    }
+
+    fn to_host_byte_order(&self, dest: &mut Self) {
+        dest.magic = self.magic;
+        dest.version_major = self.version_major.to_be();
+        dest.version_minor = self.version_minor.to_be();
+        dest.original_image_size = self.original_image_size.to_be();
+        dest.vbmeta_offset = self.vbmeta_offset.to_be();
+        dest.vbmeta_size = self.vbmeta_size.to_be();
+    }
+
+    pub fn file_has_footer(f: &mut dyn IoDelegate) -> Result<bool> {
+        let footer = AvbFooter::from_file(f)?;
+
+        Ok(footer.map_or(false, |f| f.magic == AVB_FOOTER_MAGIC[0..4]))
+    }
 }
 impl AvbHashDescriptorFlags {
     pub const AVB_HASH_DESCRIPTOR_FLAGS_DO_NOT_USE_AB: AvbHashDescriptorFlags =
@@ -555,6 +685,39 @@ fn bindgen_test_layout_AvbHashDescriptor() {
         )
     );
 }
+impl AvbHashDescriptor {
+    pub fn from_bytes(src: &[u8]) -> Result<Self> {
+        if src.len() < size_of::<AvbHashDescriptor>() {
+            return Err(anyhow!("Invalid descriptor"));
+        }
+        let mut descriptor = Self::new_zeroed();
+        Self::to_host_byte_order(unsafe { &*(src.as_ptr() as *const Self) }, &mut descriptor);
+
+        Ok(descriptor)
+    }
+
+    fn to_host_byte_order(&self, dest: &mut Self) {
+        dest.parent_descriptor.tag = self.parent_descriptor.tag.to_be();
+        dest.parent_descriptor.num_bytes_following = self.parent_descriptor.num_bytes_following.to_be();
+        dest.image_size = self.image_size.to_be();
+        dest.hash_algorithm = self.hash_algorithm;
+        dest.partition_name_len = self.partition_name_len.to_be();
+        dest.salt_len = self.salt_len.to_be();
+        dest.digest_len = self.digest_len.to_be();
+        dest.flags = self.flags.to_be();
+        dest.reserved = self.reserved;
+    }
+
+    fn to_be_bytes(&self) -> [u8; size_of::<Self>()] {
+        let mut bytes = [0u8; size_of::<Self>()];
+        self.to_host_byte_order(unsafe { &mut *(bytes.as_mut_ptr() as *mut Self) });
+        bytes
+    }
+
+    pub fn algorithm_name(&self) -> String {
+        String::from_utf8_lossy(&self.hash_algorithm).trim_end_matches('\0').to_string()
+    }
+}
 impl Default for AvbHashDescriptor {
     fn default() -> Self {
         let mut s = ::core::mem::MaybeUninit::<Self>::uninit();
@@ -562,6 +725,49 @@ impl Default for AvbHashDescriptor {
             ::core::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
             s.assume_init()
         }
+    }
+}
+#[derive(Clone)]
+pub struct AvbHashDescriptorInfo {
+    pub descriptor: AvbHashDescriptor,
+    pub partition_name: Vec<u8>,
+    pub salt: Vec<u8>,
+    pub digest: Vec<u8>,
+}
+impl AvbHashDescriptorInfo {
+    pub fn from_bytes(src: &[u8]) -> Result<Self> {
+        let descriptor = AvbHashDescriptor::from_bytes(src)?;
+
+        let mut offset = size_of::<AvbHashDescriptor>();
+        let partition_name = src[offset..offset + descriptor.partition_name_len as usize].to_vec();
+        offset += descriptor.partition_name_len as usize;
+        let salt = src[offset..offset + descriptor.salt_len as usize].to_vec();
+        offset += descriptor.salt_len as usize;
+        let digest = src[offset..offset + descriptor.digest_len as usize].to_vec();
+
+        Ok(Self {
+            descriptor,
+            partition_name,
+            salt,
+            digest,
+        })
+    }
+
+    pub fn fix_header(&mut self) {
+        self.descriptor.partition_name_len = self.partition_name.len() as u32;
+        self.descriptor.salt_len = self.salt.len() as u32;
+        self.descriptor.digest_len = self.digest.len() as u32;
+        self.descriptor.parent_descriptor.num_bytes_following = (size_of::<AvbHashDescriptor>() - AVB_DESCRIPTOR_SIZE + self.partition_name.len() + self.salt.len() + self.digest.len()) as u64;
+        self.descriptor.parent_descriptor.num_bytes_following += padding_size(self.descriptor.parent_descriptor.num_bytes_following as usize, DESCRIPTOR_ALIGN) as u64;
+    }
+
+    pub fn to_be_bytes(&self) -> Vec<u8> {
+        let mut bytes = self.descriptor.to_be_bytes().to_vec();
+        bytes.extend_from_slice(&self.partition_name);
+        bytes.extend_from_slice(&self.salt);
+        bytes.extend_from_slice(&self.digest);
+        pad_right(&mut bytes, DESCRIPTOR_ALIGN);
+        bytes
     }
 }
 impl AvbHashtreeDescriptorFlags {
@@ -1250,6 +1456,64 @@ fn bindgen_test_layout_AvbPropertyDescriptor() {
         )
     );
 }
+impl AvbPropertyDescriptor {
+    pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        if data.len() < size_of::<Self>() {
+            return Err(anyhow!("Invalid descriptor"));
+        }
+        let mut dest = Self::new_zeroed();
+        Self::ref_from_bytes(&data[0..size_of::<Self>()])
+            .map_err(|_| anyhow!("Invalid descriptor"))?
+            .to_host_byte_order(&mut dest);
+        Ok(dest)
+    }
+
+    pub fn to_be_bytes(&self) -> Vec<u8> {
+        let mut dest = Self::new_zeroed();
+        self.to_host_byte_order(&mut dest);
+        dest.as_bytes().to_vec()
+    }
+
+    fn to_host_byte_order(&self, dest: &mut Self) {
+        dest.parent_descriptor.tag = self.parent_descriptor.tag.to_be();
+        dest.parent_descriptor.num_bytes_following = self.parent_descriptor.num_bytes_following.to_be();
+        dest.key_num_bytes = self.key_num_bytes.to_be();
+        dest.value_num_bytes = self.value_num_bytes.to_be();
+    }
+}
+#[derive(Clone)]
+pub struct AvbPropertyDescriptorInfo {
+    pub descriptor: AvbPropertyDescriptor,
+    pub key: Vec<u8>,
+    pub value: Vec<u8>,
+}
+impl AvbPropertyDescriptorInfo {
+    fn from_bytes(data: &[u8]) -> Result<Self> {
+        let descriptor = AvbPropertyDescriptor::from_bytes(data)?;
+        let mut offset = size_of::<AvbPropertyDescriptor>();
+        let key = data[offset..offset + descriptor.key_num_bytes as usize].to_vec();
+        offset += descriptor.key_num_bytes as usize + 1;
+        let value = data[offset..offset + descriptor.value_num_bytes as usize].to_vec();
+        Ok(Self { descriptor, key, value })
+    }
+
+    pub fn fix_header(&mut self) {
+        self.descriptor.key_num_bytes = self.key.len() as u64;
+        self.descriptor.value_num_bytes = self.value.len() as u64;
+        self.descriptor.parent_descriptor.num_bytes_following = (size_of::<AvbPropertyDescriptor>() - AVB_DESCRIPTOR_SIZE + self.key.len() + 1 + self.value.len() + 1) as u64;
+        self.descriptor.parent_descriptor.num_bytes_following += padding_size(self.descriptor.parent_descriptor.num_bytes_following as usize, DESCRIPTOR_ALIGN) as u64;
+    }
+
+    pub fn to_be_bytes(&self) -> Vec<u8> {
+        let mut data = self.descriptor.to_be_bytes();
+        data.extend_from_slice(self.key.as_bytes());
+        data.push(0);
+        data.extend_from_slice(self.value.as_bytes());
+        data.push(0);
+        pad_right(&mut data, DESCRIPTOR_ALIGN);
+        data
+    }
+}
 impl AvbVBMetaImageFlags {
     pub const AVB_VBMETA_IMAGE_FLAGS_HASHTREE_DISABLED: AvbVBMetaImageFlags =
         AvbVBMetaImageFlags(1);
@@ -1283,12 +1547,6 @@ impl ::core::ops::BitAndAssign for AvbVBMetaImageFlags {
     fn bitand_assign(&mut self, rhs: AvbVBMetaImageFlags) {
         self.0 &= rhs.0;
     }
-}
-unsafe extern "C" {
-    pub fn avb_vbmeta_image_header_to_host_byte_order(
-        src: *const AvbVBMetaImageHeader,
-        dest: *mut AvbVBMetaImageHeader,
-    );
 }
 #[repr(transparent)]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
@@ -1549,6 +1807,75 @@ fn bindgen_test_layout_AvbVBMetaImageHeader() {
             stringify!(reserved)
         )
     );
+}
+impl AvbVBMetaImageHeader {
+    pub fn from_bytes(src: &[u8]) -> Result<Self> {
+        if src.len() < HEADER_SIZE {
+            return Err(anyhow!("Invalid VBMeta image header"));
+        }
+        let mut dest = Self::new_zeroed();
+        Self::to_host_byte_order(unsafe { &*(src.as_ptr() as *const Self) }, &mut dest);
+        Ok(dest)
+    }
+
+    pub fn to_be_bytes(&self) -> Vec<u8> {
+        let mut dest = Self::new_zeroed();
+        self.to_host_byte_order(&mut dest);
+        dest.as_bytes().to_vec()
+    }
+
+    fn to_host_byte_order(&self, dest: &mut Self) {
+        dest.magic = self.magic;
+        dest.required_libavb_version_major = self.required_libavb_version_major.to_be();
+        dest.required_libavb_version_minor = self.required_libavb_version_minor.to_be();
+        dest.authentication_data_block_size = self.authentication_data_block_size.to_be();
+        dest.auxiliary_data_block_size = self.auxiliary_data_block_size.to_be();
+        dest.algorithm_type = self.algorithm_type.to_be();
+        dest.hash_offset = self.hash_offset.to_be();
+        dest.hash_size = self.hash_size.to_be();
+        dest.signature_offset = self.signature_offset.to_be();
+        dest.signature_size = self.signature_size.to_be();
+        dest.public_key_offset = self.public_key_offset.to_be();
+        dest.public_key_size = self.public_key_size.to_be();
+        dest.public_key_metadata_offset = self.public_key_metadata_offset.to_be();
+        dest.public_key_metadata_size = self.public_key_metadata_size.to_be();
+        dest.descriptors_offset = self.descriptors_offset.to_be();
+        dest.descriptors_size = self.descriptors_size.to_be();
+        dest.rollback_index = self.rollback_index.to_be();
+        dest.flags = self.flags.to_be();
+        dest.rollback_index_location = self.rollback_index_location.to_be();
+        dest.release_string = self.release_string;
+    }
+
+    pub fn get_hash<'a>(&'a self, authentication_data: &'a [u8]) -> Result<&'a [u8]> {
+        authentication_data
+            .get(self.hash_offset as usize..self.hash_offset as usize + self.hash_size as usize)
+            .ok_or(anyhow!("Invalid hash offset"))
+    }
+
+    pub fn get_signature<'a>(&'a self, authentication_data: &'a [u8]) -> Result<&'a [u8]> {
+        authentication_data
+            .get(self.signature_offset as usize..self.signature_offset as usize + self.signature_size as usize)
+            .ok_or(anyhow!("Invalid signature offset"))
+    }
+
+    pub fn get_public_key<'a>(&'a self, auxiliary_data: &'a [u8]) -> Result<&'a [u8]> {
+        auxiliary_data
+            .get(self.public_key_offset as usize..self.public_key_offset as usize + self.public_key_size as usize)
+            .ok_or(anyhow!("Invalid public key offset"))
+    }
+
+    pub fn get_public_key_metadata<'a>(&'a self, auxiliary_data: &'a [u8]) -> Result<&'a [u8]> {
+        auxiliary_data
+            .get(self.public_key_metadata_offset as usize..self.public_key_metadata_offset as usize + self.public_key_metadata_size as usize)
+            .ok_or(anyhow!("Invalid public key metadata offset"))
+    }
+
+    pub fn get_descriptors<'a>(&'a self, auxiliary_data: &'a [u8]) -> Result<&'a [u8]> {
+        auxiliary_data
+            .get(self.descriptors_offset as usize..self.descriptors_offset as usize + self.descriptors_size as usize)
+            .ok_or(anyhow!("Invalid descriptors offset"))
+    }
 }
 impl Default for AvbVBMetaImageHeader {
     fn default() -> Self {
@@ -2370,5 +2697,131 @@ impl Default for AvbCertOps {
             ::core::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
             s.assume_init()
         }
+    }
+}
+
+#[derive(Clone)]
+pub struct AvbRawDescriptor {
+    data: Vec<u8>,
+}
+
+impl AvbRawDescriptor {
+    fn from_bytes(data: &[u8]) -> Self {
+        Self { data: data.to_vec() }
+    }
+}
+
+#[derive(Clone)]
+pub enum AvbDescriptorEnum {
+    Hash(AvbHashDescriptorInfo),
+    Property(AvbPropertyDescriptorInfo),
+    Raw(AvbRawDescriptor),
+}
+
+impl AvbDescriptorEnum {
+    pub fn to_be_bytes(&self) -> Vec<u8> {
+        match self {
+            AvbDescriptorEnum::Hash(hash_descriptor) => hash_descriptor.to_be_bytes(),
+            AvbDescriptorEnum::Property(property_descriptor) => property_descriptor.to_be_bytes(),
+            AvbDescriptorEnum::Raw(raw_descriptor) => raw_descriptor.data.clone(),
+        }
+    }
+}
+
+pub struct VBMeta {
+    pub header: AvbVBMetaImageHeader,
+    pub authentication_data: Vec<u8>,
+    pub auxiliary_data: Vec<u8>,
+    pub descriptors: Vec<AvbDescriptorEnum>,
+    pub footer: Option<AvbFooter>,
+    pub partition_name: Option<String>,
+}
+
+impl VBMeta {
+    pub fn from_device(f: &mut dyn IoDelegate) -> Result<Self> {
+        use std::io::SeekFrom;
+
+        let footer = AvbFooter::from_file(f)?;
+
+        let header_offset = footer.as_ref().map_or(0, |f| f.vbmeta_offset);
+        f.seek(SeekFrom::Start(header_offset))?;
+        let mut header_buf = vec![0; HEADER_SIZE];
+        f.read_exact(&mut header_buf)?;
+
+        let header = AvbVBMetaImageHeader::from_bytes(&header_buf)?;
+
+        if &header.magic == &AVB_MAGIC[0..4] {
+            info!("Magic ok.");
+        } else {
+            return Err(anyhow!("VBMeta magic is not valid."));
+        }
+
+        // VBMeta = AvbVBMetaImageHeader + Authentication data + Auxiliary data
+        // Authentication data = hash + signature
+        // Auxiliary data = descriptor + public key + publib key metadata
+        let authentication_data_offset = header_offset as usize + HEADER_SIZE;
+        let auxiliary_data_offset = authentication_data_offset + header.authentication_data_block_size as usize;
+
+        f.seek(SeekFrom::Start(authentication_data_offset as u64))?;
+        let mut authentication_data = vec![0; header.authentication_data_block_size as usize];
+        f.read_exact(&mut authentication_data)?;
+
+        f.seek(SeekFrom::Start(auxiliary_data_offset as u64))?;
+        let mut auxiliary_data = vec![0; header.auxiliary_data_block_size as usize];
+        f.read_exact(&mut auxiliary_data)?;
+
+        let descriptors_data = header.get_descriptors(&auxiliary_data)?;
+
+        let original_image = if let Some(footer) = &footer {
+            f.seek(SeekFrom::Start(0))?;
+            let mut image_data = vec![0; footer.original_image_size as usize];
+            f.read_exact(&mut image_data)?;
+            Some((footer.original_image_size, image_data))
+        } else {
+            None
+        };
+
+        let mut offset = 0;
+        let mut descriptors = vec![];
+        while offset < descriptors_data.len() {
+            let descriptor = AvbDescriptor::from_bytes(&descriptors_data[offset..offset + AVB_DESCRIPTOR_SIZE])?;
+
+            let tag = descriptor.tag;
+            let num_bytes_following = descriptor.num_bytes_following as usize;
+
+            let descriptor_data = &descriptors_data[offset..offset + AVB_DESCRIPTOR_SIZE + num_bytes_following as usize];
+
+            if tag == AvbDescriptorTag::AVB_DESCRIPTOR_TAG_HASH as u64 {
+                let hash_descriptor_info = AvbHashDescriptorInfo::from_bytes(descriptor_data)?;
+                descriptors.push(AvbDescriptorEnum::Hash(hash_descriptor_info));
+            } else if tag == AvbDescriptorTag::AVB_DESCRIPTOR_TAG_PROPERTY as u64 {
+                let property_descriptor_info = AvbPropertyDescriptorInfo::from_bytes(descriptor_data)?;
+                descriptors.push(AvbDescriptorEnum::Property(property_descriptor_info));
+            } else {
+                let avb_raw_descriptor = AvbRawDescriptor::from_bytes(descriptor_data);
+                descriptors.push(AvbDescriptorEnum::Raw(avb_raw_descriptor));
+            }
+
+            offset += AVB_DESCRIPTOR_SIZE + num_bytes_following as usize;
+        }
+        let partition_name = descriptors.iter().find_map(|descriptor| {
+            if let AvbDescriptorEnum::Hash(hash_descriptor_info) = descriptor {
+                return Some(String::from_utf8(hash_descriptor_info.partition_name.to_vec()).ok()?);
+            }
+            None
+        });
+        Ok(Self {
+            header,
+            authentication_data,
+            auxiliary_data,
+            descriptors,
+            footer,
+            partition_name,
+        })
+    }
+
+    pub fn get_partition_name(f: &mut dyn IoDelegate) -> Result<String> {
+        let vbmeta = Self::from_device(f)?;
+        vbmeta.partition_name.ok_or(anyhow!("Partition name not found"))
     }
 }
