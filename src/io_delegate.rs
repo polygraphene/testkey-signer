@@ -1,7 +1,11 @@
 use std::io::{Read, Write, Seek};
 use anyhow::{Result, anyhow};
+
+#[cfg(test)]
 use std::collections::HashMap;
+#[cfg(test)]
 use std::sync::{Arc, Mutex};
+
 use std::os::unix::io::AsRawFd;
 
 pub trait IoDelegate: Read + Write + Seek {
@@ -60,6 +64,9 @@ impl IoDelegate for RealDevice {
     }
 
     fn set_writable(&mut self) -> Result<()> {
+        if !self.is_device {
+            return Ok(());
+        }
         const BLKROSET_CODE: u8 = 0x12;
         const BLKROSET_SEQ: u8 = 93;
         ioctl_write_ptr_bad!(ioctl_blkroset, request_code_none!(BLKROSET_CODE, BLKROSET_SEQ), i32);
@@ -70,11 +77,13 @@ impl IoDelegate for RealDevice {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone)]
 pub struct MockDevice {
     pub data: Arc<Mutex<std::io::Cursor<Vec<u8>>>>,
 }
 
+#[cfg(test)]
 impl MockDevice {
     pub fn new(data: Vec<u8>) -> Self {
         Self {
@@ -87,12 +96,14 @@ impl MockDevice {
     }
 }
 
+#[cfg(test)]
 impl Read for MockDevice {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         self.data.lock().unwrap().read(buf)
     }
 }
 
+#[cfg(test)]
 impl Write for MockDevice {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.data.lock().unwrap().write(buf)
@@ -102,12 +113,14 @@ impl Write for MockDevice {
     }
 }
 
+#[cfg(test)]
 impl Seek for MockDevice {
     fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
         self.data.lock().unwrap().seek(pos)
     }
 }
 
+#[cfg(test)]
 impl IoDelegate for MockDevice {
     fn get_size(&mut self) -> Result<usize> {
         Ok(self.data.lock().unwrap().get_ref().len())
@@ -122,7 +135,7 @@ pub trait Environment {
     fn get_prop(&self, name: &str) -> Result<String>;
     fn open_device(&self, name: &str, is_device: bool, write: bool) -> Result<Box<dyn IoDelegate>>;
     fn device_exists(&self, name: &str) -> bool;
-    fn set_writable(&self, name: &str) -> Result<()>;
+    fn set_writable(&self, name: &str, is_device: bool) -> Result<()>;
 }
 
 pub struct RealEnvironment;
@@ -165,19 +178,21 @@ impl Environment for RealEnvironment {
         file_opts.open(name).is_ok()
     }
 
-    fn set_writable(&self, name: &str) -> Result<()> {
+    fn set_writable(&self, name: &str, is_device: bool) -> Result<()> {
         let mut file_opts = std::fs::OpenOptions::new();
         file_opts.read(true);
         let f = file_opts.open(name)?;
-        RealDevice::new(f, true).set_writable()
+        RealDevice::new(f, is_device).set_writable()
     }
 }
 
+#[cfg(test)]
 pub struct MockEnvironment {
     pub props: HashMap<String, String>,
     pub devices: std::sync::Mutex<HashMap<String, MockDevice>>,
 }
 
+#[cfg(test)]
 impl Environment for MockEnvironment {
     fn get_prop(&self, name: &str) -> Result<String> {
         self.props.get(name).cloned().ok_or_else(|| anyhow!("Property {name} not found in MockEnvironment"))
@@ -197,7 +212,7 @@ impl Environment for MockEnvironment {
         devices.contains_key(name)
     }
 
-    fn set_writable(&self, _name: &str) -> Result<()> {
+    fn set_writable(&self, _name: &str, _is_device: bool) -> Result<()> {
         Ok(())
     }
 }

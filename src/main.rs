@@ -41,6 +41,7 @@ extern crate nix;
 
 use crate::bindings::AvbAlgorithmType;
 use crate::bindings::AvbDescriptorTag;
+use crate::bindings::AvbDescriptorTag::AVB_DESCRIPTOR_TAG_HASH;
 use crate::bindings::AvbFooter;
 use crate::bindings::AvbPropertyDescriptor;
 use crate::bindings::AvbRSAPublicKeyHeader;
@@ -110,6 +111,15 @@ fn avb_footer_to_host_byte_order(src: &AvbFooter, dest: &mut AvbFooter) {
     dest.vbmeta_size = src.vbmeta_size.to_be();
 }
 
+fn avb_footer_bytes_to_host_byte_order(src: &[u8], dest: &mut AvbFooter) -> Result<()> {
+    if src.len() < FOOTER_SIZE {
+        return Err(anyhow!("Invalid footer size"));
+    }
+    let footer = unsafe { std::ptr::read(src.as_ptr() as *const AvbFooter) };
+    avb_footer_to_host_byte_order(&footer, dest);
+    Ok(())
+}
+
 fn avb_descriptor_to_host_byte_order(src: &AvbDescriptor, dest: &mut AvbDescriptor) {
     dest.tag = src.tag.to_be();
     dest.num_bytes_following = src.num_bytes_following.to_be();
@@ -164,6 +174,57 @@ fn avb_property_descriptor_bytes_to_host_byte_order(src: &[u8], dest: &mut AvbPr
 fn avb_pubkey_to_host_byte_order(src: &AvbRSAPublicKeyHeader, dest: &mut AvbRSAPublicKeyHeader) {
     dest.key_num_bits = src.key_num_bits.to_be();
     dest.n0inv = src.n0inv.to_be();
+}
+
+fn read_footer(f: &mut dyn IoDelegate) -> Result<AvbFooter> {
+    let filesize = f.get_size()?;
+    if filesize < FOOTER_SIZE {
+        return Err(anyhow!("Cannot read footer"));
+    }
+    let mut footer_bytes = vec![0u8; FOOTER_SIZE];
+    f.seek(std::io::SeekFrom::End(-(FOOTER_SIZE as i64)))?;
+    f.read_exact(&mut footer_bytes)?;
+    let mut footer = AvbFooter::new_zeroed();
+    avb_footer_bytes_to_host_byte_order(&footer_bytes, &mut footer)?;
+    Ok(footer)
+}
+
+fn file_has_footer(f: &mut dyn IoDelegate) -> Result<bool> {
+    let footer = read_footer(f)?;
+    
+    Ok(footer.magic == AVB_FOOTER_MAGIC[0..4])
+}
+
+fn get_partition_name(f: &mut dyn IoDelegate) -> Result<String> {
+    let footer = read_footer(f)?;
+    
+    f.seek(std::io::SeekFrom::Start(footer.vbmeta_offset as u64))?;
+    let mut vbmeta_bytes = vec![0u8; footer.vbmeta_size as usize];
+    f.read_exact(&mut vbmeta_bytes)?;
+    let mut vbmeta = AvbVBMetaImageHeader::new_zeroed();
+    avb_vbmeta_image_header_bytes_to_host_byte_order(&vbmeta_bytes, &mut vbmeta)?;
+
+    let descriptor_offset_in_file = footer.vbmeta_offset as usize + HEADER_SIZE + vbmeta.authentication_data_block_size as usize + vbmeta.descriptors_offset as usize;
+    f.seek(std::io::SeekFrom::Start(descriptor_offset_in_file as u64))?;
+    let mut descriptor_bytes = vec![0u8; vbmeta.descriptors_size as usize];
+    f.read_exact(&mut descriptor_bytes)?;
+    let mut pos = 0;
+    while pos < descriptor_bytes.len() {
+        let mut descriptor = AvbDescriptor::new_zeroed();
+        avb_descriptor_bytes_to_host_byte_order(&descriptor_bytes[pos..pos + AVB_DESCRIPTOR_SIZE], &mut descriptor)?;
+        let buf = &descriptor_bytes[pos..pos + AVB_DESCRIPTOR_SIZE + descriptor.num_bytes_following as usize];
+
+        if descriptor.tag == AVB_DESCRIPTOR_TAG_HASH as u64 {
+            let mut hash_descriptor = AvbHashDescriptor::new_zeroed();
+            avb_hash_descriptor_bytes_to_host_byte_order(buf, &mut hash_descriptor)?;
+
+            let pos2 = std::mem::size_of::<AvbHashDescriptor>();
+            let partition_name = String::from_utf8(buf[pos2..pos2 + hash_descriptor.partition_name_len as usize].to_vec())?;
+            return Ok(partition_name);
+        }
+        pos += AVB_DESCRIPTOR_SIZE + descriptor.num_bytes_following as usize;
+    }
+    return Err(anyhow!("No hash descriptor found"));
 }
 
 fn hex(bin: &[u8]) -> String {
@@ -260,7 +321,6 @@ enum KeyBits {
 
 struct PartitionInfo {
     original_image_size: usize,
-    image_data: Vec<u8>,
     partition_sizes_match: bool,
     partition_hashes_match: bool,
 }
@@ -452,7 +512,7 @@ fn parse_vbmeta(f: &mut dyn IoDelegate, filesize: usize, is_vbmeta: bool, replac
             let salt = &descriptors_data[pos_hash..pos_hash + hash_descriptor.salt_len as usize];
             pos_hash += hash_descriptor.salt_len as usize;
             let digest = &descriptors_data[pos_hash..pos_hash + hash_descriptor.digest_len as usize];
-            pos_hash += hash_descriptor.digest_len as usize;
+            // pos_hash += hash_descriptor.digest_len as usize;
             let algo_name = String::from_utf8(hash_descriptor.hash_algorithm.to_vec())?.trim_end_matches('\0').to_string();
             debug!("Hash descriptor information:");
             debug!("Algorithm: {}", algo_name);
@@ -515,10 +575,9 @@ fn parse_vbmeta(f: &mut dyn IoDelegate, filesize: usize, is_vbmeta: bool, replac
     trace!("New descriptors:");
     trace!("{}", hexdump(&new_descriptors_data));
 
-    let partition_info = if let Some((original_image_size, image_data)) = original_image {
+    let partition_info = if let Some((original_image_size, _image_data)) = original_image {
         Some(PartitionInfo {
             original_image_size: original_image_size as usize,
-            image_data: image_data,
             partition_hashes_match: partition_hashes_match,
             partition_sizes_match: parititon_sizes_match,
         })
@@ -675,12 +734,16 @@ fn patch_boot_spl(descriptors_data: &mut Vec<u8>, boot_spl: &str) -> Result<()> 
 /// Read VBMeta from device or files and patch it.
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None, after_help = "Example:
- # Patch current slot boot partition
+ # Patch current slot partitions
  testkey-signer patch-device [--inactive-slot] [--dry-run] [--boot-spl 2025-03-05]
- # Just verify file
- testkey-signer patch-single-file boot.img
- # Patch file
- testkey-signer patch-single-file boot.img bootout.img [--boot-spl 2025-03-05]")]
+ # Verify current slot partitions
+ testkey-signer verify-device [--inactive-slot]
+ # Patch files. Files will be patched in place.
+ testkey-signer patch-file boot.img [--boot-spl 2025-03-05]
+ # Can patch multiple files at once. Non-chained partition must be patched simultaneously.
+ testkey-signer patch-file vbmeta.img boot.img init_boot.img ... [--boot-spl 2025-03-05]
+ # Just verify files
+ testkey-signer verify-file boot.img")]
 struct Args {
     #[command(subcommand)]
     command: Commands,
@@ -710,16 +773,28 @@ enum Commands {
         #[arg(short = 'b', long = "boot-spl")]
         boot_spl: Option<String>,
     },
+    /// Verify current slot partitions.
     #[command(arg_required_else_help = true)]
-    PatchSingleFile {
-        /// Input filename.
-        input_filename: String,
-        /// Optional output filename. If not specified, output is not generated.
-        output_filename: Option<String>,
+    VerifyDevice {
+        /// Verify inactive slot instead of current slot.
+        #[arg(short = 'i', long = "inactive-slot")]
+        inactive_slot: bool,
+    },
+    /// Patch files. Files will be patched in place.
+    #[command(arg_required_else_help = true)]
+    PatchFile {
+        /// Input filenames.
+        input_filenames: Vec<String>,
 
         /// Patch SPL for boot partition. Format: YYYY-MM-DD.
         #[arg(short = 'b', long = "boot-spl")]
         boot_spl: Option<String>,
+    },
+    /// Verify files.
+    #[command(arg_required_else_help = true)]
+    VerifyFile {
+        /// Input filenames.
+        input_filenames: Vec<String>,
     },
 }
 
@@ -731,75 +806,61 @@ fn main() -> Result<()> {
 }
 
 fn run(args: Args, env: &dyn Environment) -> Result<()> {
-    match &args.command {
+    match args.command {
         Commands::PatchDevice {
             inactive_slot,
             yes,
             dry_run,
             boot_spl,
         } => {
-            return run_patch_device(env, *inactive_slot, *yes, *dry_run, boot_spl.clone());
+            return run_patch_device(env, inactive_slot, yes, dry_run, boot_spl);
         }
-        Commands::PatchSingleFile { input_filename, output_filename, boot_spl } => {
-            return run_patch_single_file(env, input_filename, output_filename, boot_spl.clone());
+        Commands::VerifyDevice { inactive_slot } => {
+            return run_patch_device(env, inactive_slot, false, true, None);
         }
-    };
+        Commands::PatchFile { input_filenames, boot_spl } => {
+            return run_patch_files(env, input_filenames, false, boot_spl);
+        }
+        Commands::VerifyFile { input_filenames } => {
+            return run_patch_files(env, input_filenames, true, None);
+        }
+    }
 }
 
-fn run_patch_single_file(env: &dyn Environment, input_filename: &str, output_filename: &Option<String>, boot_spl: Option<String>) -> Result<()> {
-    let mut device = env.open_device(input_filename, false, false)?;
-    let filesize = device.get_size()?;
+fn run_patch_files(env: &dyn Environment, input_filenames: Vec<String>, dry_run: bool, boot_spl: Option<String>) -> Result<()> {
+    let mut partition_set = HashMap::new();
+    let mut vbmeta_idx = None;
+    for (i, input_filename) in input_filenames.iter().enumerate() {
+        let mut device = env.open_device(input_filename, false, false)?;
 
-    if filesize == 0 {
-        return Err(anyhow!("Cannot get filesize of {input_filename}"));
-    }
-
-    info!("Parsing VBMeta for {input_filename}.");
-    let mut parsed = parse_vbmeta(device.as_mut(), filesize, false, None)?;
-    if let Some(boot_spl) = boot_spl {
-        patch_boot_spl(&mut parsed.new_descriptors_data, &boot_spl)?;
-    }
-
-    parsed.print_result();
-    if parsed.is_valid() {
-        info!("Hash and signature are all okay. So no need to re-sign. Exit.");
-        return Ok(());
-    }
-
-    let Some(output_filename) = output_filename else {
-        info!("No output filename provided. Exit.");
-        return Ok(());
-    };
-
-    // Re-generate VBMeta structures and sign them.
-    info!("Generating new VBMeta");
-    let testkey = match parsed.key_num_bits {
-        Some(num_bits) => {
-            let testkey = match num_bits {
-                KeyBits::Key2048 => TESTKEY_2048,
-                KeyBits::Key4096 => TESTKEY_4096,
-            };
-            Some(RsaPrivateKey::from_pkcs1_pem(String::from_utf8(testkey.to_vec())?.as_str())?)
-        }
-        None => None,
-    };
-    let new_vbmeta = generate_new_header(&parsed.header, parsed.new_descriptors_data, testkey, parsed.partition_info.as_ref().map(|p| p.original_image_size))?;
-
-    warn!("Writing output file: {output_filename}");
-    let mut f_out = std::fs::File::create(output_filename)?;
-    match new_vbmeta.footer {
-        Some(footer) => {
-            f_out.write_all(&parsed.partition_info.as_ref().expect("No partition info").image_data)?;
-            f_out.write_all(&new_vbmeta.vbmeta_bytes)?;
-            f_out.seek(std::io::SeekFrom::Start((filesize - FOOTER_SIZE) as u64))?;
-            f_out.write_all(unsafe { std::slice::from_raw_parts(&footer as *const AvbFooter as *const u8, FOOTER_SIZE) })?;
-        }
-        None => {
-            f_out.write_all(&new_vbmeta.vbmeta_bytes)?;
+        if !file_has_footer(device.as_mut())? {
+            // It must be vbmeta.
+            if vbmeta_idx.is_some() {
+                return Err(anyhow!("Multiple vbmeta files found: {} and {}", input_filenames[vbmeta_idx.unwrap()], input_filename));
+            }
+            vbmeta_idx = Some(i);
+            partition_set.insert(
+                "vbmeta".to_string(),
+                Partition {
+                    name: "vbmeta".to_string(),
+                    path: input_filename.to_string(),
+                    is_device: false,
+                },
+            );
+        } else {
+            let partition_name = get_partition_name(device.as_mut())?;
+            partition_set.insert(
+                partition_name.to_string(),
+                Partition {
+                    name: partition_name.to_string(),
+                    path: input_filename.to_string(),
+                    is_device: false,
+                },
+            );
         }
     }
-    warn!("Patching done.");
-    Ok(())
+
+    run_patch(env, partition_set, true, dry_run, boot_spl)
 }
 
 fn get_test_key(key_num_bits: Option<KeyBits>) -> Result<Option<RsaPrivateKey>> {
@@ -852,11 +913,31 @@ fn run_patch_device(env: &dyn Environment, inactive_slot: bool, yes: bool, dry_r
             );
         }
     }
+    let vbmeta_device = format!("/dev/block/by-name/vbmeta{slot_suffix}");
+    if !env.device_exists(&vbmeta_device) {
+        return Err(anyhow!("VBMeta device not found."));
+    }
+    partition_set.insert(
+        "vbmeta".to_string(),
+        Partition {
+            name: "vbmeta".to_string(),
+            path: vbmeta_device,
+            is_device: true,
+        },
+    );
 
+    run_patch(env, partition_set, yes, dry_run, boot_spl)
+}
+
+fn run_patch(env: &dyn Environment, partition_set: HashMap<String, Partition>, yes: bool, dry_run: bool, boot_spl: Option<String>) -> Result<()> {
     let mut parsed_vbmeta_list = vec![];
     let mut replace_hash_descriptors = HashMap::new();
+    let mut has_non_chained_partition = false;
     for partition in partition_set.values() {
-        let mut device = env.open_device(&partition.path, true, false)?;
+        if partition.name == "vbmeta" {
+            continue;
+        }
+        let mut device = env.open_device(&partition.path, partition.is_device, false)?;
         let filesize = device.get_size()?;
         if filesize == 0 {
             return Err(anyhow!("Cannot get filesize of {}", partition.path));
@@ -865,6 +946,7 @@ fn run_patch_device(env: &dyn Environment, inactive_slot: bool, yes: bool, dry_r
         let mut parsed = parse_vbmeta(device.as_mut(), filesize, false, None).context(format!("Failed to parse VBMeta for {}", partition.path))?;
         if let Some(parent_vbmeta_hash_descriptor) = &mut parsed.parent_vbmeta_hash_descriptor {
             replace_hash_descriptors.insert(partition.name.clone(), std::mem::take(parent_vbmeta_hash_descriptor));
+            has_non_chained_partition = true;
         }
         if let Some(boot_spl) = &boot_spl {
             patch_boot_spl(&mut parsed.new_descriptors_data, boot_spl)?;
@@ -872,60 +954,87 @@ fn run_patch_device(env: &dyn Environment, inactive_slot: bool, yes: bool, dry_r
         parsed_vbmeta_list.push((partition, parsed));
     }
 
-    let vbmeta_device = format!("/dev/block/by-name/vbmeta{slot_suffix}");
-    let mut device = env.open_device(&vbmeta_device, true, false)?;
-    let filesize = device.get_size()?;
+    match partition_set.get("vbmeta") {
+        Some(vbmeta) => {
+            let vbmeta_device = vbmeta.path.clone();
+            let mut device = env.open_device(&vbmeta_device, vbmeta.is_device, false)?;
+            let filesize = device.get_size()?;
 
-    if filesize == 0 {
-        return Err(anyhow!("Cannot get filesize of {vbmeta_device}"));
-    }
+            if filesize == 0 {
+                return Err(anyhow!("Cannot get filesize of {vbmeta_device}"));
+            }
 
-    info!("Parsing VBMeta for {vbmeta_device}.");
-    let mut parsed = parse_vbmeta(device.as_mut(), filesize, true, Some(&replace_hash_descriptors)).context(format!("Failed to parse VBMeta for {vbmeta_device}"))?;
-    if let Some(boot_spl) = &boot_spl {
-        patch_boot_spl(&mut parsed.new_descriptors_data, boot_spl)?;
-    }
+            info!("Parsing VBMeta for {vbmeta_device}.");
+            let mut parsed = parse_vbmeta(device.as_mut(), filesize, true, Some(&replace_hash_descriptors)).context(format!("Failed to parse VBMeta for {vbmeta_device}"))?;
+            if let Some(boot_spl) = &boot_spl {
+                patch_boot_spl(&mut parsed.new_descriptors_data, boot_spl)?;
+            }
 
-    for (partition, parsed) in &parsed_vbmeta_list {
-        info!("Partition {}", partition.name);
-        parsed.print_result();
-    }
-    info!("Partition vbmeta");
-    parsed.print_result();
-    let parent_descriptors_ok = parsed.incorrect_hash_descriptor_num.expect("Should have incorrect_hash_descriptor_num") == 0;
-    info!("Parent descriptors ok: {}", parent_descriptors_ok);
-    if parsed.is_valid() && parsed_vbmeta_list.iter().all(|(_, parsed)| parsed.is_valid()) && boot_spl.is_none() && parent_descriptors_ok {
-        info!("Hash and signature are all okay. So no need to re-sign. Exit.");
-        return Ok(());
-    }
-    if dry_run {
-        info!("Dry run, not writing to devices.");
-        return Ok(());
-    }
-    info!("Patching device");
-    if !yes {
-        print!("Really patch partitions? (y/n)");
-        std::io::stdout().flush()?;
-        let mut input = String::new();
-        std::io::stdin().read_line(&mut input)?;
-        if input.trim() != "y" {
-            println!("Aborted.");
-            return Ok(());
+            for (partition, parsed) in &parsed_vbmeta_list {
+                info!("Partition {}", partition.name);
+                parsed.print_result();
+            }
+            info!("Partition vbmeta");
+            parsed.print_result();
+            let parent_descriptors_ok = parsed.incorrect_hash_descriptor_num.expect("Should have incorrect_hash_descriptor_num") == 0;
+            info!("Parent descriptors ok: {}", parent_descriptors_ok);
+            if parsed.is_valid() && parsed_vbmeta_list.iter().all(|(_, parsed)| parsed.is_valid()) && boot_spl.is_none() && parent_descriptors_ok {
+                info!("Hash and signature are all okay. So no need to re-sign. Exit.");
+                return Ok(());
+            }
+            if dry_run {
+                info!("Dry run, not writing to devices.");
+                return Ok(());
+            }
+            info!("Patching device");
+            if !yes {
+                print!("Really patch partitions? (y/n)");
+                std::io::stdout().flush()?;
+                let mut input = String::new();
+                std::io::stdin().read_line(&mut input)?;
+                if input.trim() != "y" {
+                    println!("Aborted.");
+                    return Ok(());
+                }
+            }
+
+            // Re-generate VBMeta structures and sign them.
+            info!("Generating new VBMeta");
+            let testkey = get_test_key(parsed.key_num_bits)?;
+
+            let new_vbmeta = generate_new_header(&parsed.header, parsed.new_descriptors_data, testkey, parsed.partition_info.as_ref().map(|p| p.original_image_size))?;
+
+            env.set_writable(&vbmeta_device, vbmeta.is_device)?;
+            let mut device_write = env.open_device(&vbmeta_device, true, true)?;
+
+            device_write.write_all(&new_vbmeta.vbmeta_bytes)?;
+
+            warn!("Successfully patched {vbmeta_device}");
+        }
+        None => {
+            if has_non_chained_partition {
+                warn!("No vbmeta file found, but non-chained partitions are present. Skipping VBMeta patching.");
+            }
+            for (partition, parsed) in &parsed_vbmeta_list {
+                info!("Partition {}", partition.name);
+                parsed.print_result();
+            }
+            if parsed_vbmeta_list.iter().all(|(_, parsed)| parsed.is_valid()) && boot_spl.is_none() {
+                info!("Hash and signature are all okay. So no need to re-sign. Exit.");
+                return Ok(());
+            }
+            if !yes {
+                print!("Really patch partitions? (y/n)");
+                std::io::stdout().flush()?;
+                let mut input = String::new();
+                std::io::stdin().read_line(&mut input)?;
+                if input.trim() != "y" {
+                    println!("Aborted.");
+                    return Ok(());
+                }
+            }
         }
     }
-
-    // Re-generate VBMeta structures and sign them.
-    info!("Generating new VBMeta");
-    let testkey = get_test_key(parsed.key_num_bits)?;
-
-    let new_vbmeta = generate_new_header(&parsed.header, parsed.new_descriptors_data, testkey, parsed.partition_info.as_ref().map(|p| p.original_image_size))?;
-
-    env.set_writable(&vbmeta_device)?;
-    let mut device_write = env.open_device(&vbmeta_device, true, true)?;
-
-    device_write.write_all(&new_vbmeta.vbmeta_bytes)?;
-
-    warn!("Successfully patched {vbmeta_device}");
 
     for (partition, parsed) in parsed_vbmeta_list.into_iter() {
         info!("Patching {}", partition.path);
@@ -934,8 +1043,8 @@ fn run_patch_device(env: &dyn Environment, inactive_slot: bool, yes: bool, dry_r
         let Some(footer) = new_vbmeta.footer else {
             return Err(anyhow!("No footer was generated"));
         };
-        env.set_writable(&partition.path)?;
-        let mut device_write = env.open_device(&partition.path, true, true)?;
+        env.set_writable(&partition.path, partition.is_device)?;
+        let mut device_write = env.open_device(&partition.path, partition.is_device, true)?;
         let filesize = device_write.get_size()?;
         if filesize == 0 {
             return Err(anyhow!("Cannot get filesize of {}", partition.path));
@@ -1133,14 +1242,14 @@ mod tests {
         );
     }
 
-    fn verify_image_data(tempdir: &Tempdir, patched_data: &[u8], expected_status: bool) {
-        let outfile = tempdir.dir.join("tmp_data.img");
-        std::fs::write(&outfile, &patched_data).expect("Failed to write mock patched data A");
+    // fn verify_image_data(tempdir: &Tempdir, patched_data: &[u8], expected_status: bool) {
+    //     let outfile = tempdir.dir.join("tmp_data.img");
+    //     std::fs::write(&outfile, &patched_data).expect("Failed to write mock patched data A");
 
-        verify_file(tempdir, "tmp_data.img", expected_status);
+    //     verify_file(tempdir, "tmp_data.img", expected_status);
 
-        std::fs::remove_file(&outfile).expect("Failed to remove tmp_data.img");
-    }
+    //     std::fs::remove_file(&outfile).expect("Failed to remove tmp_data.img");
+    // }
 
     fn verify_partition_set(tempdir: &Tempdir, vbmeta_data: &[u8], bootimg: &[u8], init_bootimg: &[u8], expected_status: bool) {
         let vbmeta_file = tempdir.dir.join("vbmeta.img");
@@ -1222,9 +1331,8 @@ mod tests {
 
         run(
             Args {
-                command: Commands::PatchSingleFile {
-                    input_filename: bootimg.to_str().unwrap().to_string(),
-                    output_filename: Some(tempdir.dir.join("bootmodout.img").to_str().unwrap().to_string()),
+                command: Commands::PatchFile {
+                    input_filenames: vec![bootimg.to_str().unwrap().to_string()],
                     boot_spl: None,
                 },
                 log_level: Some("info".to_string()),
@@ -1233,7 +1341,7 @@ mod tests {
         )
         .expect("Failed to run test_patch_file");
 
-        verify_file(&tempdir, "bootmodout.img", true);
+        verify_file(&tempdir, bootimg.to_str().unwrap(), true);
     }
 
     #[test]
@@ -1251,9 +1359,8 @@ mod tests {
 
         run(
             Args {
-                command: Commands::PatchSingleFile {
-                    input_filename: bootimg.to_str().unwrap().to_string(),
-                    output_filename: Some(tempdir.dir.join("init_boot_mod_out.img").to_str().unwrap().to_string()),
+                command: Commands::PatchFile {
+                    input_filenames: vec![bootimg.to_str().unwrap().to_string()],
                     boot_spl: None,
                 },
                 log_level: Some("info".to_string()),
@@ -1262,7 +1369,7 @@ mod tests {
         )
         .expect("Failed to run test_patch_init_boot_file");
 
-        verify_file_without_key(&tempdir, "init_boot_mod_out.img", true);
+        verify_file_without_key(&tempdir, bootimg.to_str().unwrap(), true);
     }
 
     // #[test]
@@ -1300,8 +1407,8 @@ mod tests {
         let boot_data = std::fs::read(&bootimg).expect("Failed to read boot.img");
         let init_boot_data = std::fs::read(&init_bootimg).expect("Failed to read init_boot.img");
 
-        let mut vbmeta_data_a = vbmeta_data.clone();
-        let mut vbmeta_data_b = vbmeta_data.clone();
+        let vbmeta_data_a = vbmeta_data.clone();
+        let vbmeta_data_b = vbmeta_data.clone();
         let mut boot_data_a = boot_data.clone();
         let mut boot_data_b = boot_data.clone();
         let mut init_boot_data_a = init_boot_data.clone();
