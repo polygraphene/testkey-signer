@@ -5,7 +5,7 @@ use sha2::Digest;
 use anyhow::Result;
 use anyhow::anyhow;
 
-use crate::bindings::AvbAlgorithmType;
+use crate::avb::AvbAlgorithmType;
 
 const SHA256_ALGOES: [u32; 3] = [
     AvbAlgorithmType::AVB_ALGORITHM_TYPE_SHA256_RSA2048 as u32,

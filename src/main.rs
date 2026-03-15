@@ -1,4 +1,4 @@
-mod bindings;
+mod avb;
 mod hasher;
 mod io_delegate;
 mod testkey;
@@ -39,17 +39,17 @@ use anyhow::anyhow;
 #[macro_use]
 extern crate nix;
 
-use crate::bindings::AvbAlgorithmType;
-use crate::bindings::AvbDescriptorTag;
-use crate::bindings::AvbDescriptorTag::AVB_DESCRIPTOR_TAG_HASH;
-use crate::bindings::AvbFooter;
-use crate::bindings::AvbPropertyDescriptor;
-use crate::bindings::AvbRSAPublicKeyHeader;
-use crate::bindings::AvbVBMetaImageHeader;
-use crate::bindings::AVB_FOOTER_MAGIC;
-use crate::bindings::AVB_MAGIC;
-use crate::bindings::AvbDescriptor;
-use crate::bindings::AvbHashDescriptor;
+use crate::avb::AvbAlgorithmType;
+use crate::avb::AvbDescriptorTag;
+use crate::avb::AvbDescriptorTag::AVB_DESCRIPTOR_TAG_HASH;
+use crate::avb::AvbFooter;
+use crate::avb::AvbPropertyDescriptor;
+use crate::avb::AvbRSAPublicKeyHeader;
+use crate::avb::AvbVBMetaImageHeader;
+use crate::avb::AVB_FOOTER_MAGIC;
+use crate::avb::AVB_MAGIC;
+use crate::avb::AvbDescriptor;
+use crate::avb::AvbHashDescriptor;
 
 use crate::hasher::Hasher;
 use crate::testkey::TESTKEY_2048;
