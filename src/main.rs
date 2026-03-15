@@ -774,7 +774,6 @@ enum Commands {
         boot_spl: Option<String>,
     },
     /// Verify current slot partitions.
-    #[command(arg_required_else_help = true)]
     VerifyDevice {
         /// Verify inactive slot instead of current slot.
         #[arg(short = 'i', long = "inactive-slot")]
