@@ -13,6 +13,8 @@ nix = { version = "0.31.2", default-features = false, features = ["ioctl"] }
 num-bigint-dig = { version = "0.8", default-features = false }
 num-traits = "*"
 rsa = { version = "0.9.10", features = ["hazmat", "pem", "sha1", "sha2", "std"], default-features = false }
+serde = { version = "1.0.228", default-features = false, features = ["derive", "std"] }
+serde_json = { version = "1.0.149", default-features = false, features = ["std"] }
 sha2 = "0.10.9"
 zerocopy = { version = "0.8.42", features = ["derive", "std"] }
 

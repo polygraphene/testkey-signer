@@ -1,0 +1,6 @@
+id=testkey-signer
+name=testkey-signer
+version=1.0.0
+versionCode=1
+author=polygraphene
+description=Sign vbmeta and other partitions with test keys for Lenovo tablets.

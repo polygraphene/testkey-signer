@@ -8,6 +8,8 @@ use io_delegate::Environment;
 use io_delegate::IoDelegate;
 use io_delegate::RealEnvironment;
 use zerocopy::FromZeros;
+use serde::Serialize;
+use serde::Deserialize;
 
 use std::collections::HashMap;
 use std::io::Seek;
@@ -154,7 +156,7 @@ enum KeyBits {
     Key4096,
 }
 
-#[derive(Clone)]
+#[derive(Serialize, Deserialize, Copy, Clone)]
 struct PartitionInfo {
     original_image_size: usize,
     partition_sizes_match: bool,
@@ -173,12 +175,39 @@ struct ParsedHeaders {
     incorrect_hash_descriptor_num: Option<usize>,
 }
 
+#[derive(Serialize, Deserialize, Clone)]
+struct PartitionResult {
+    vbmeta_hashes_match: Option<bool>,
+    vbmeta_signatures_match: Option<bool>,
+    partition_info: Option<PartitionInfo>,
+    incorrect_hash_descriptor_num: Option<usize>,
+}
+
+impl PartitionResult {
+    fn is_valid(&self) -> bool {
+        self.vbmeta_hashes_match.unwrap_or(true) && self.vbmeta_signatures_match.unwrap_or(true) && self.partition_info.as_ref().map_or(true, |p| p.partition_sizes_match && p.partition_hashes_match)
+    }
+}
+
+impl From<&ParsedHeaders> for PartitionResult {
+    fn from(parsed: &ParsedHeaders) -> Self {
+        PartitionResult {
+            vbmeta_hashes_match: parsed.vbmeta_hashes_match,
+            vbmeta_signatures_match: parsed.vbmeta_signatures_match,
+            partition_info: parsed.partition_info,
+            incorrect_hash_descriptor_num: parsed.incorrect_hash_descriptor_num,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
 struct VerificationResult {
+    slot_suffix: Option<String>,
     all_ok: bool,
     /// When vbmeta partition is included in input, show if hash descriptors between vbmeta and other partitions match.
     /// When vbmeta partition is not included in input, this will be None.
     hash_descriptors_match: Option<bool>,
-    parsed_headers: HashMap<String, ParsedHeaders>,
+    partition_results: HashMap<String, PartitionResult>,
 }
 
 impl ParsedHeaders {
@@ -484,6 +513,10 @@ struct Args {
 
     #[arg(short, long)]
     log_level: Option<String>,
+
+    /// Print output in JSON format.
+    #[arg(short, long, global = true, default_value = "false")]
+    json: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -560,7 +593,7 @@ fn run(args: Args, env: &dyn Environment) -> Result<()> {
         }
         Commands::VerifyDevice { inactive_slot } => {
             let result = run_patch_device(env, inactive_slot, false, true, true, None, false)?;
-            print_verification_result(&result);
+            print_verification_result(&result, args.json);
 
             return Ok(());
         }
@@ -570,15 +603,19 @@ fn run(args: Args, env: &dyn Environment) -> Result<()> {
         }
         Commands::VerifyFile { input_filenames } => {
             let result = run_patch_files(env, input_filenames, true, true, None, false)?;
-            print_verification_result(&result);
+            print_verification_result(&result, args.json);
 
             return Ok(());
         }
     }
 }
 
-fn print_verification_result(result: &VerificationResult) {
-    for (partition, result) in result.parsed_headers.iter() {
+fn print_verification_result(result: &VerificationResult, json: bool) {
+    if json {
+        println!("{}", serde_json::to_string(result).unwrap());
+        return;
+    }
+    for (partition, result) in result.partition_results.iter() {
         println!("Partition {}: {}", partition, ok_ng(result.is_valid()));
     }
     if let Some(hash_descriptors_match) = result.hash_descriptors_match {
@@ -686,7 +723,9 @@ fn run_patch_device(env: &dyn Environment, inactive_slot: bool, yes: bool, dry_r
         },
     );
 
-    run_patch(env, partition_set, yes, dry_run, only_verify, boot_spl, disable_verity)
+    let mut verification_result = run_patch(env, partition_set, yes, dry_run, only_verify, boot_spl, disable_verity)?;
+    verification_result.slot_suffix = Some(slot_suffix.to_string());
+    Ok(verification_result)
 }
 
 fn run_patch(env: &dyn Environment, partition_set: HashMap<String, Partition>, yes: bool, dry_run: bool, only_verify: bool, boot_spl: Option<String>, disable_verity: bool) -> Result<VerificationResult> {
@@ -731,12 +770,12 @@ fn run_patch(env: &dyn Environment, partition_set: HashMap<String, Partition>, y
             info!("Parent descriptors ok: {}", parent_descriptors_ok);
             let all_ok = parsed.is_valid() && parsed_vbmeta_list.iter().all(|(_, parsed)| parsed.is_valid()) && boot_spl.is_none() && !disable_verity && parent_descriptors_ok;
 
-            let mut parsed_headers = HashMap::new();
-            parsed_headers.insert(vbmeta.name.clone(), parsed.clone());
+            let mut partition_results = HashMap::new();
+            partition_results.insert(vbmeta.name.clone(), (&parsed).into());
             for (partition, parsed) in &parsed_vbmeta_list {
-                parsed_headers.insert(partition.name.clone(), parsed.clone());
+                partition_results.insert(partition.name.clone(), parsed.into());
             }
-            let verification_result = VerificationResult { all_ok, hash_descriptors_match: Some(parent_descriptors_ok), parsed_headers };
+            let verification_result = VerificationResult { slot_suffix: None, all_ok, hash_descriptors_match: Some(parent_descriptors_ok), partition_results };
 
             if only_verify {
                 return Ok(verification_result);
@@ -786,11 +825,11 @@ fn run_patch(env: &dyn Environment, partition_set: HashMap<String, Partition>, y
             }
             let all_ok = parsed_vbmeta_list.iter().all(|(_, parsed)| parsed.is_valid()) && boot_spl.is_none();
 
-            let mut parsed_headers = HashMap::new();
+            let mut partition_results = HashMap::new();
             for (partition, parsed) in &parsed_vbmeta_list {
-                parsed_headers.insert(partition.name.clone(), parsed.clone());
+                partition_results.insert(partition.name.clone(), parsed.into());
             }
-            let verification_result = VerificationResult { all_ok, hash_descriptors_match: None, parsed_headers };
+            let verification_result = VerificationResult { slot_suffix: None, all_ok, hash_descriptors_match: None, partition_results };
 
             if only_verify {
                 return Ok(verification_result);
@@ -1152,6 +1191,7 @@ mod tests {
                     disable_verity: false,
                 },
                 log_level: Some("info".to_string()),
+                json: false,
             },
             &RealEnvironment,
         )
@@ -1181,6 +1221,7 @@ mod tests {
                     disable_verity: false,
                 },
                 log_level: Some("info".to_string()),
+                json: false,
             },
             &RealEnvironment,
         )
@@ -1260,6 +1301,7 @@ mod tests {
             Args {
                 command: Commands::PatchDevice { yes: true, inactive_slot: false, dry_run: false, boot_spl: Some("Modified boot spl".to_string()), disable_verity: false },
                 log_level: Some("info".to_string()),
+                json: false,
             },
             &mock_env,
         )
@@ -1283,6 +1325,7 @@ mod tests {
             Args {
                 command: Commands::PatchDevice { yes: true, inactive_slot: true, dry_run: false, boot_spl: Some("Modified boot spl 2".to_string()), disable_verity: false },
                 log_level: Some("info".to_string()),
+                json: false,
             },
             &mock_env,
         )
@@ -1314,10 +1357,10 @@ mod tests {
             .expect("Failed to patch files");
         assert!(result.all_ok);
         assert_eq!(result.hash_descriptors_match, Some(true));
-        assert!(result.parsed_headers.contains_key("vbmeta"));
-        assert!(result.parsed_headers.contains_key("boot"));
-        assert!(result.parsed_headers.contains_key("init_boot"));
-        for (name, partition_result) in result.parsed_headers.iter() {
+        assert!(result.partition_results.contains_key("vbmeta"));
+        assert!(result.partition_results.contains_key("boot"));
+        assert!(result.partition_results.contains_key("init_boot"));
+        for (name, partition_result) in result.partition_results.iter() {
             if name == "vbmeta" {
                 assert_eq!(partition_result.incorrect_hash_descriptor_num, Some(0));
             } else if name == "boot" {
@@ -1343,10 +1386,10 @@ mod tests {
             .expect("Failed to patch files");
         assert!(!result.all_ok);
         assert_eq!(result.hash_descriptors_match, Some(true));
-        assert!(result.parsed_headers.contains_key("vbmeta"));
-        assert!(result.parsed_headers.contains_key("boot"));
-        assert!(result.parsed_headers.contains_key("init_boot"));
-        for (name, partition_result) in result.parsed_headers.iter() {
+        assert!(result.partition_results.contains_key("vbmeta"));
+        assert!(result.partition_results.contains_key("boot"));
+        assert!(result.partition_results.contains_key("init_boot"));
+        for (name, partition_result) in result.partition_results.iter() {
             if name == "vbmeta" {
                 assert_eq!(partition_result.incorrect_hash_descriptor_num, Some(0));
                 assert_eq!(partition_result.vbmeta_hashes_match, Some(true));
@@ -1375,10 +1418,10 @@ mod tests {
             .expect("Failed to patch files");
         assert!(!result.all_ok);
         assert_eq!(result.hash_descriptors_match, Some(false));
-        assert!(result.parsed_headers.contains_key("vbmeta"));
-        assert!(result.parsed_headers.contains_key("boot"));
-        assert!(result.parsed_headers.contains_key("init_boot"));
-        for (name, partition_result) in result.parsed_headers.iter() {
+        assert!(result.partition_results.contains_key("vbmeta"));
+        assert!(result.partition_results.contains_key("boot"));
+        assert!(result.partition_results.contains_key("init_boot"));
+        for (name, partition_result) in result.partition_results.iter() {
             if name == "vbmeta" {
                 assert_eq!(partition_result.incorrect_hash_descriptor_num, Some(1));
                 assert_eq!(partition_result.vbmeta_hashes_match, Some(true));
