@@ -275,9 +275,10 @@ fn parse_vbmeta(f: &mut dyn IoDelegate, is_vbmeta: bool, replace_hash_descriptor
     for descriptor in &vbmeta.descriptors {
         match descriptor {
             AvbDescriptorEnum::Hash(hash_descriptor) => {
+                let partition_name = String::from_utf8_lossy(&hash_descriptor.partition_name).to_string();
                 debug!("Hash descriptor information:");
                 debug!("Algorithm: {}", hash_descriptor.descriptor.algorithm_name());
-                debug!("Partition name: {}", String::from_utf8_lossy(&hash_descriptor.partition_name));
+                debug!("Partition name: {}", partition_name);
                 debug!("Salt  : {}", hex(&hash_descriptor.salt));
                 debug!("Digest: {}", hex(&hash_descriptor.digest));
                 let algo_name = hash_descriptor.descriptor.algorithm_name();
@@ -314,14 +315,17 @@ fn parse_vbmeta(f: &mut dyn IoDelegate, is_vbmeta: bool, replace_hash_descriptor
                     }
                     // For vbmeta partitions, use the provided child hash descriptors.
                     _ => {
-                        if let (Some(replace_hash_descriptors), Some(partition_name)) = (replace_hash_descriptors, &vbmeta.partition_name) {
-                            if let Some(new_hash_desc) = replace_hash_descriptors.get(partition_name) {
-                                info!("Replacing hash descriptors for {partition_name} in vbmeta partition buffer.");
-                                trace!("{}", hexdump(&new_hash_desc.to_be_bytes()));
-                                if new_hash_desc.digest != hash_descriptor.digest {
+                        if let Some(replace_hash_descriptors) = replace_hash_descriptors {
+                            if let Some(new_hash_desc) = replace_hash_descriptors.get(&partition_name) {
+                                if new_hash_desc.to_be_bytes() == hash_descriptor.to_be_bytes() {
+                                    info!("Hash descriptors for {partition_name} match. No need for replace.");
+                                    new_descriptors.push(AvbDescriptorEnum::Hash(hash_descriptor.clone()));
+                                } else {
+                                    info!("Replacing hash descriptors for {partition_name} in vbmeta partition.");
+                                    trace!("{}", hexdump(&new_hash_desc.to_be_bytes()));
                                     incorrect_hash_descriptor_num += 1;
+                                    new_descriptors.push(AvbDescriptorEnum::Hash(new_hash_desc.clone()));
                                 }
-                                new_descriptors.push(AvbDescriptorEnum::Hash(new_hash_desc.clone()));
                             } else {
                                 new_descriptors.push(AvbDescriptorEnum::Hash(hash_descriptor.clone()));
                             }

@@ -2805,12 +2805,16 @@ impl VBMeta {
 
             offset += AVB_DESCRIPTOR_SIZE + num_bytes_following as usize;
         }
-        let partition_name = descriptors.iter().find_map(|descriptor| {
-            if let AvbDescriptorEnum::Hash(hash_descriptor_info) = descriptor {
-                return Some(String::from_utf8(hash_descriptor_info.partition_name.to_vec()).ok()?);
-            }
+        let partition_name = if footer.is_some() {
+            descriptors.iter().find_map(|descriptor| {
+                if let AvbDescriptorEnum::Hash(hash_descriptor_info) = descriptor {
+                    return Some(String::from_utf8(hash_descriptor_info.partition_name.to_vec()).ok()?);
+                }
+                None
+            })
+        } else {
             None
-        });
+        };
         Ok(Self {
             header,
             authentication_data,
