@@ -214,7 +214,7 @@ fn parse_vbmeta(f: &mut dyn IoDelegate, is_vbmeta: bool, replace_hash_descriptor
         (None, None, None)
     } else {
         let mut hasher = Hasher::new(algo_type)?;
-        hasher.update(&vbmeta.header.as_bytes());
+        hasher.update(&vbmeta.header.to_be_bytes());
         hasher.update(&vbmeta.auxiliary_data);
         let hash_calc = hasher.finalize();
 
@@ -787,6 +787,7 @@ mod tests {
     }
 
     static TEMP_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static SALT: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
 
     impl Tempdir {
         fn new() -> Self {
@@ -824,6 +825,8 @@ mod tests {
             .arg("boot")
             .arg("--algorithm")
             .arg("SHA256_RSA4096")
+            .arg("--salt")
+            .arg(SALT)
             .arg("--key")
             .arg("testkey_rsa4096.pem")
             .arg("--rollback_index")
@@ -866,6 +869,8 @@ mod tests {
             .arg("init_boot")
             .arg("--algorithm")
             .arg("NONE")
+            .arg("--salt")
+            .arg(SALT)
             .arg("--rollback_index")
             .arg("123")
             .arg("--prop")
@@ -1200,5 +1205,23 @@ mod tests {
         verify_partition_set(&tempdir, &patched_vbmeta_data_a, &patched_boot_data_a, &patched_init_boot_data_a, true);
         verify_partition_set(&tempdir, &patched_vbmeta_data_b, &patched_boot_data_b, &patched_init_boot_data_b, true);
         assert_eq!(get_boot_spl(&tempdir, &patched_boot_data_b).expect("Failed to get boot spl"), "Modified boot spl 2");
+    }
+
+    #[test]
+    fn test_verify_file() {
+        let tempdir = Tempdir::new();
+        let (vbmetaimg, bootimg, init_bootimg) = prepare_partition_set(&tempdir);
+        let vbmeta_data = std::fs::read(&vbmetaimg).expect("Failed to read vbmeta.img");
+        let boot_data = std::fs::read(&bootimg).expect("Failed to read boot.img");
+        let init_boot_data = std::fs::read(&init_bootimg).expect("Failed to read init_boot.img");
+
+        run(
+            Args {
+                command: Commands::VerifyFile { input_filenames: vec![vbmetaimg.to_str().unwrap().to_string(), bootimg.to_str().unwrap().to_string(), init_bootimg.to_str().unwrap().to_string()] },
+                log_level: Some("info".to_string()),
+            },
+            &RealEnvironment {},
+        )
+        .expect("Failed to verify file");
     }
 }
