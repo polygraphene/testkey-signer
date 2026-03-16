@@ -1305,6 +1305,8 @@ mod tests {
 
     #[test]
     fn test_verify_file() {
+        let _ = env_logger::builder().is_test(true).try_init();
+
         let tempdir = Tempdir::new();
         let (vbmetaimg, bootimg, init_bootimg) = prepare_partition_set(&tempdir);
 
