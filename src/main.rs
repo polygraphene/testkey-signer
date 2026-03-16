@@ -198,18 +198,6 @@ fn ok_ng(b: bool) -> &'static str {
     if b { "OK" } else { "NG" }
 }
 
-fn get_key_bits(key_bits: KeyBits) -> usize {
-    match key_bits {
-        KeyBits::Key2048 => 2048,
-        KeyBits::Key4096 => 4096,
-    }
-}
-
-#[allow(dead_code)]
-fn get_key_bytes(key_bits: KeyBits) -> usize {
-    get_key_bits(key_bits) / 8
-}
-
 fn parse_vbmeta(f: &mut dyn IoDelegate, is_vbmeta: bool, replace_hash_descriptors: Option<&HashMap<String, AvbHashDescriptorInfo>>) -> Result<ParsedHeaders> {
     let vbmeta = VBMeta::from_device(f)?;
 
@@ -1273,6 +1261,9 @@ mod tests {
             .expect("Failed to patch files");
         assert!(result.all_ok);
         assert_eq!(result.hash_descriptors_match, Some(true));
+        assert!(result.parsed_headers.contains_key("vbmeta"));
+        assert!(result.parsed_headers.contains_key("boot"));
+        assert!(result.parsed_headers.contains_key("init_boot"));
         for (name, partition_result) in result.parsed_headers.iter() {
             if name == "vbmeta" {
                 assert_eq!(partition_result.incorrect_hash_descriptor_num, Some(0));
@@ -1299,6 +1290,9 @@ mod tests {
             .expect("Failed to patch files");
         assert!(!result.all_ok);
         assert_eq!(result.hash_descriptors_match, Some(true));
+        assert!(result.parsed_headers.contains_key("vbmeta"));
+        assert!(result.parsed_headers.contains_key("boot"));
+        assert!(result.parsed_headers.contains_key("init_boot"));
         for (name, partition_result) in result.parsed_headers.iter() {
             if name == "vbmeta" {
                 assert_eq!(partition_result.incorrect_hash_descriptor_num, Some(0));
@@ -1328,6 +1322,9 @@ mod tests {
             .expect("Failed to patch files");
         assert!(!result.all_ok);
         assert_eq!(result.hash_descriptors_match, Some(false));
+        assert!(result.parsed_headers.contains_key("vbmeta"));
+        assert!(result.parsed_headers.contains_key("boot"));
+        assert!(result.parsed_headers.contains_key("init_boot"));
         for (name, partition_result) in result.parsed_headers.iter() {
             if name == "vbmeta" {
                 assert_eq!(partition_result.incorrect_hash_descriptor_num, Some(1));
