@@ -2728,6 +2728,7 @@ impl AvbDescriptorEnum {
     }
 }
 
+#[derive(Clone)]
 pub struct VBMeta {
     pub header: AvbVBMetaImageHeader,
     pub authentication_data: Vec<u8>,

@@ -8,7 +8,6 @@ use io_delegate::Environment;
 use io_delegate::IoDelegate;
 use io_delegate::RealEnvironment;
 use zerocopy::FromZeros;
-use zerocopy::IntoBytes;
 
 use std::collections::HashMap;
 use std::io::Seek;
@@ -154,12 +153,14 @@ enum KeyBits {
     Key4096,
 }
 
+#[derive(Clone)]
 struct PartitionInfo {
     original_image_size: usize,
     partition_sizes_match: bool,
     partition_hashes_match: bool,
 }
 
+#[derive(Clone)]
 struct ParsedHeaders {
     key_num_bits: Option<KeyBits>,
     header: VBMeta,
@@ -171,19 +172,30 @@ struct ParsedHeaders {
     incorrect_hash_descriptor_num: Option<usize>,
 }
 
+struct VerificationResult {
+    all_ok: bool,
+    /// When vbmeta partition is included in input, show if hash descriptors between vbmeta and other partitions match.
+    /// When vbmeta partition is not included in input, this will be None.
+    hash_descriptors_match: Option<bool>,
+    parsed_headers: HashMap<String, ParsedHeaders>,
+}
+
 impl ParsedHeaders {
     fn is_valid(&self) -> bool {
         self.vbmeta_hashes_match.unwrap_or(true) && self.vbmeta_signatures_match.unwrap_or(true) && self.partition_info.as_ref().map_or(true, |p| p.partition_sizes_match && p.partition_hashes_match)
     }
 
     fn print_result(&self) {
-        let f = |b| if let Some(b) = b { if b { "OK" } else { "NG" } } else { "N/A" };
-        let g = |b| if b { "OK" } else { "NG" };
+        let f = |b| if let Some(b) = b { ok_ng(b) } else { "N/A" };
         info!("VBMeta Hash: {}", f(self.vbmeta_hashes_match));
         info!("VBMeta Signature: {}", f(self.vbmeta_signatures_match));
-        info!("Partition Hash: {}", self.partition_info.as_ref().map_or("N/A", |p| g(p.partition_hashes_match)));
-        info!("Partition Size: {}", self.partition_info.as_ref().map_or("N/A", |p| g(p.partition_sizes_match)));
+        info!("Partition Hash: {}", self.partition_info.as_ref().map_or("N/A", |p| ok_ng(p.partition_hashes_match)));
+        info!("Partition Size: {}", self.partition_info.as_ref().map_or("N/A", |p| ok_ng(p.partition_sizes_match)));
     }
+}
+
+fn ok_ng(b: bool) -> &'static str {
+    if b { "OK" } else { "NG" }
 }
 
 fn get_key_bits(key_bits: KeyBits) -> usize {
@@ -538,21 +550,39 @@ fn run(args: Args, env: &dyn Environment) -> Result<()> {
             dry_run,
             boot_spl,
         } => {
-            return run_patch_device(env, inactive_slot, yes, dry_run, boot_spl);
+            run_patch_device(env, inactive_slot, yes, dry_run, false, boot_spl)?;
+            return Ok(());
         }
         Commands::VerifyDevice { inactive_slot } => {
-            return run_patch_device(env, inactive_slot, false, true, None);
+            let result = run_patch_device(env, inactive_slot, false, true, true, None)?;
+            print_verification_result(&result);
+
+            return Ok(());
         }
         Commands::PatchFile { input_filenames, boot_spl } => {
-            return run_patch_files(env, input_filenames, false, boot_spl);
+            run_patch_files(env, input_filenames, false, false, boot_spl)?;
+            return Ok(());
         }
         Commands::VerifyFile { input_filenames } => {
-            return run_patch_files(env, input_filenames, true, None);
+            let result = run_patch_files(env, input_filenames, true, true, None)?;
+            print_verification_result(&result);
+
+            return Ok(());
         }
     }
 }
 
-fn run_patch_files(env: &dyn Environment, input_filenames: Vec<String>, dry_run: bool, boot_spl: Option<String>) -> Result<()> {
+fn print_verification_result(result: &VerificationResult) {
+    for (partition, result) in result.parsed_headers.iter() {
+        println!("Partition {}: {}", partition, ok_ng(result.is_valid()));
+    }
+    if let Some(hash_descriptors_match) = result.hash_descriptors_match {
+        println!("Matching of vbmeta and other partitions: {}", ok_ng(hash_descriptors_match));
+    }
+    println!("Overall result: {}", ok_ng(result.all_ok));
+}
+
+fn run_patch_files(env: &dyn Environment, input_filenames: Vec<String>, dry_run: bool, only_verify: bool, boot_spl: Option<String>) -> Result<VerificationResult> {
     let mut partition_set = HashMap::new();
     let mut vbmeta_idx = None;
     for (i, input_filename) in input_filenames.iter().enumerate() {
@@ -585,7 +615,7 @@ fn run_patch_files(env: &dyn Environment, input_filenames: Vec<String>, dry_run:
         }
     }
 
-    run_patch(env, partition_set, true, dry_run, boot_spl)
+    run_patch(env, partition_set, true, dry_run, only_verify, boot_spl)
 }
 
 fn get_test_key(key_num_bits: Option<KeyBits>) -> Result<Option<RsaPrivateKey>> {
@@ -601,7 +631,7 @@ fn get_test_key(key_num_bits: Option<KeyBits>) -> Result<Option<RsaPrivateKey>> 
     }
 }
 
-fn run_patch_device(env: &dyn Environment, inactive_slot: bool, yes: bool, dry_run: bool, boot_spl: Option<String>) -> Result<()> {
+fn run_patch_device(env: &dyn Environment, inactive_slot: bool, yes: bool, dry_run: bool, only_verify: bool, boot_spl: Option<String>) -> Result<VerificationResult> {
     let slot_suffix = env.get_prop("ro.boot.slot_suffix").unwrap_or_default();
     if !slot_suffix.is_empty() {
         info!("Current slot: {}", slot_suffix.trim_start_matches("_"));
@@ -651,10 +681,10 @@ fn run_patch_device(env: &dyn Environment, inactive_slot: bool, yes: bool, dry_r
         },
     );
 
-    run_patch(env, partition_set, yes, dry_run, boot_spl)
+    run_patch(env, partition_set, yes, dry_run, only_verify, boot_spl)
 }
 
-fn run_patch(env: &dyn Environment, partition_set: HashMap<String, Partition>, yes: bool, dry_run: bool, boot_spl: Option<String>) -> Result<()> {
+fn run_patch(env: &dyn Environment, partition_set: HashMap<String, Partition>, yes: bool, dry_run: bool, only_verify: bool, boot_spl: Option<String>) -> Result<VerificationResult> {
     let mut parsed_vbmeta_list = vec![];
     let mut replace_hash_descriptors = HashMap::new();
     let mut has_non_chained_partition = false;
@@ -675,7 +705,7 @@ fn run_patch(env: &dyn Environment, partition_set: HashMap<String, Partition>, y
         parsed_vbmeta_list.push((partition, parsed));
     }
 
-    match partition_set.get("vbmeta") {
+    let verification_result = match partition_set.get("vbmeta") {
         Some(vbmeta) => {
             let vbmeta_device = vbmeta.path.clone();
             let mut device = env.open_device(&vbmeta_device, vbmeta.is_device, false)?;
@@ -687,20 +717,32 @@ fn run_patch(env: &dyn Environment, partition_set: HashMap<String, Partition>, y
             }
 
             for (partition, parsed) in &parsed_vbmeta_list {
-                info!("Partition {}", partition.name);
+                info!("=== Partition {} ===", partition.name);
                 parsed.print_result();
             }
-            info!("Partition vbmeta");
+            info!("=== Partition vbmeta ===");
             parsed.print_result();
             let parent_descriptors_ok = parsed.incorrect_hash_descriptor_num.expect("Should have incorrect_hash_descriptor_num") == 0;
             info!("Parent descriptors ok: {}", parent_descriptors_ok);
-            if parsed.is_valid() && parsed_vbmeta_list.iter().all(|(_, parsed)| parsed.is_valid()) && boot_spl.is_none() && parent_descriptors_ok {
+            let all_ok = parsed.is_valid() && parsed_vbmeta_list.iter().all(|(_, parsed)| parsed.is_valid()) && boot_spl.is_none() && parent_descriptors_ok;
+
+            let mut parsed_headers = HashMap::new();
+            parsed_headers.insert(vbmeta.name.clone(), parsed.clone());
+            for (partition, parsed) in &parsed_vbmeta_list {
+                parsed_headers.insert(partition.name.clone(), parsed.clone());
+            }
+            let verification_result = VerificationResult { all_ok, hash_descriptors_match: Some(parent_descriptors_ok), parsed_headers };
+
+            if only_verify {
+                return Ok(verification_result);
+            }
+            if all_ok {
                 info!("Hash and signature are all okay. So no need to re-sign. Exit.");
-                return Ok(());
+                return Ok(verification_result);
             }
             if dry_run {
                 info!("Dry run, not writing to devices.");
-                return Ok(());
+                return Ok(verification_result);
             }
             info!("Patching device");
             if !yes {
@@ -710,7 +752,7 @@ fn run_patch(env: &dyn Environment, partition_set: HashMap<String, Partition>, y
                 std::io::stdin().read_line(&mut input)?;
                 if input.trim() != "y" {
                     println!("Aborted.");
-                    return Ok(());
+                    return Ok(verification_result);
                 }
             }
 
@@ -726,6 +768,8 @@ fn run_patch(env: &dyn Environment, partition_set: HashMap<String, Partition>, y
             device_write.write_all(&new_vbmeta.vbmeta_bytes)?;
 
             warn!("Successfully patched {vbmeta_device}");
+
+            verification_result
         }
         None => {
             if has_non_chained_partition {
@@ -735,9 +779,20 @@ fn run_patch(env: &dyn Environment, partition_set: HashMap<String, Partition>, y
                 info!("Partition {}", partition.name);
                 parsed.print_result();
             }
-            if parsed_vbmeta_list.iter().all(|(_, parsed)| parsed.is_valid()) && boot_spl.is_none() {
+            let all_ok = parsed_vbmeta_list.iter().all(|(_, parsed)| parsed.is_valid()) && boot_spl.is_none();
+
+            let mut parsed_headers = HashMap::new();
+            for (partition, parsed) in &parsed_vbmeta_list {
+                parsed_headers.insert(partition.name.clone(), parsed.clone());
+            }
+            let verification_result = VerificationResult { all_ok, hash_descriptors_match: None, parsed_headers };
+
+            if only_verify {
+                return Ok(verification_result);
+            }
+            if all_ok {
                 info!("Hash and signature are all okay. So no need to re-sign. Exit.");
-                return Ok(());
+                return Ok(verification_result);
             }
             if !yes {
                 print!("Really patch partitions? (y/n)");
@@ -746,11 +801,13 @@ fn run_patch(env: &dyn Environment, partition_set: HashMap<String, Partition>, y
                 std::io::stdin().read_line(&mut input)?;
                 if input.trim() != "y" {
                     println!("Aborted.");
-                    return Ok(());
+                    return Ok(verification_result);
                 }
             }
+
+            verification_result
         }
-    }
+    };
 
     for (partition, parsed) in parsed_vbmeta_list.into_iter() {
         info!("Patching {}", partition.path);
@@ -773,7 +830,7 @@ fn run_patch(env: &dyn Environment, partition_set: HashMap<String, Partition>, y
     }
     warn!("Successfully patched all partitions");
 
-    Ok(())
+    Ok(verification_result)
 }
 
 #[cfg(test)]
@@ -1211,17 +1268,85 @@ mod tests {
     fn test_verify_file() {
         let tempdir = Tempdir::new();
         let (vbmetaimg, bootimg, init_bootimg) = prepare_partition_set(&tempdir);
-        let vbmeta_data = std::fs::read(&vbmetaimg).expect("Failed to read vbmeta.img");
-        let boot_data = std::fs::read(&bootimg).expect("Failed to read boot.img");
-        let init_boot_data = std::fs::read(&init_bootimg).expect("Failed to read init_boot.img");
 
-        run(
-            Args {
-                command: Commands::VerifyFile { input_filenames: vec![vbmetaimg.to_str().unwrap().to_string(), bootimg.to_str().unwrap().to_string(), init_bootimg.to_str().unwrap().to_string()] },
-                log_level: Some("info".to_string()),
-            },
-            &RealEnvironment {},
-        )
-        .expect("Failed to verify file");
+        let result = run_patch_files(&RealEnvironment {}, vec![vbmetaimg.to_str().unwrap().to_string(), bootimg.to_str().unwrap().to_string(), init_bootimg.to_str().unwrap().to_string()], false, true, None)
+            .expect("Failed to patch files");
+        assert!(result.all_ok);
+        assert_eq!(result.hash_descriptors_match, Some(true));
+        for (name, partition_result) in result.parsed_headers.iter() {
+            if name == "vbmeta" {
+                assert_eq!(partition_result.incorrect_hash_descriptor_num, Some(0));
+            } else if name == "boot" {
+                assert_eq!(partition_result.incorrect_hash_descriptor_num, None);
+                assert_eq!(partition_result.vbmeta_hashes_match, Some(true));
+                assert_eq!(partition_result.vbmeta_signatures_match, Some(true));
+                assert_eq!(partition_result.partition_info.as_ref().unwrap().partition_hashes_match, true);
+                assert_eq!(partition_result.partition_info.as_ref().unwrap().partition_sizes_match, true);
+            } else if name == "init_boot" {
+                assert_eq!(partition_result.incorrect_hash_descriptor_num, None);
+                assert_eq!(partition_result.vbmeta_hashes_match, None);
+                assert_eq!(partition_result.vbmeta_signatures_match, None);
+                assert_eq!(partition_result.partition_info.as_ref().unwrap().partition_hashes_match, true);
+                assert_eq!(partition_result.partition_info.as_ref().unwrap().partition_sizes_match, true);
+            }
+        }
+
+        let mut f = std::fs::OpenOptions::new().read(true).write(true).open(&bootimg).expect("Failed to open boot_mod.img");
+        f.write_all(b"tampered").expect("Failed to write boot_mod.img");
+        drop(f);
+
+        let result = run_patch_files(&RealEnvironment {}, vec![vbmetaimg.to_str().unwrap().to_string(), bootimg.to_str().unwrap().to_string(), init_bootimg.to_str().unwrap().to_string()], false, true, None)
+            .expect("Failed to patch files");
+        assert!(!result.all_ok);
+        assert_eq!(result.hash_descriptors_match, Some(true));
+        for (name, partition_result) in result.parsed_headers.iter() {
+            if name == "vbmeta" {
+                assert_eq!(partition_result.incorrect_hash_descriptor_num, Some(0));
+                assert_eq!(partition_result.vbmeta_hashes_match, Some(true));
+                assert_eq!(partition_result.vbmeta_signatures_match, Some(true));
+                assert!(partition_result.partition_info.is_none());
+            } else if name == "boot" {
+                assert_eq!(partition_result.incorrect_hash_descriptor_num, None);
+                assert_eq!(partition_result.vbmeta_hashes_match, Some(true));
+                assert_eq!(partition_result.vbmeta_signatures_match, Some(true));
+                assert_eq!(partition_result.partition_info.as_ref().unwrap().partition_hashes_match, false);
+                assert_eq!(partition_result.partition_info.as_ref().unwrap().partition_sizes_match, true);
+            } else if name == "init_boot" {
+                assert_eq!(partition_result.incorrect_hash_descriptor_num, None);
+                assert_eq!(partition_result.vbmeta_hashes_match, None);
+                assert_eq!(partition_result.vbmeta_signatures_match, None);
+                assert_eq!(partition_result.partition_info.as_ref().unwrap().partition_hashes_match, true);
+                assert_eq!(partition_result.partition_info.as_ref().unwrap().partition_sizes_match, true);
+            }
+        }
+
+        let mut f = std::fs::OpenOptions::new().read(true).write(true).open(&init_bootimg).expect("Failed to open init_boot.img");
+        f.write_all(b"tampered").expect("Failed to write init_boot.img");
+        drop(f);
+
+        let result = run_patch_files(&RealEnvironment {}, vec![vbmetaimg.to_str().unwrap().to_string(), bootimg.to_str().unwrap().to_string(), init_bootimg.to_str().unwrap().to_string()], false, true, None)
+            .expect("Failed to patch files");
+        assert!(!result.all_ok);
+        assert_eq!(result.hash_descriptors_match, Some(false));
+        for (name, partition_result) in result.parsed_headers.iter() {
+            if name == "vbmeta" {
+                assert_eq!(partition_result.incorrect_hash_descriptor_num, Some(1));
+                assert_eq!(partition_result.vbmeta_hashes_match, Some(true));
+                assert_eq!(partition_result.vbmeta_signatures_match, Some(true));
+                assert!(partition_result.partition_info.is_none());
+            } else if name == "boot" {
+                assert_eq!(partition_result.incorrect_hash_descriptor_num, None);
+                assert_eq!(partition_result.vbmeta_hashes_match, Some(true));
+                assert_eq!(partition_result.vbmeta_signatures_match, Some(true));
+                assert_eq!(partition_result.partition_info.as_ref().unwrap().partition_hashes_match, false);
+                assert_eq!(partition_result.partition_info.as_ref().unwrap().partition_sizes_match, true);
+            } else if name == "init_boot" {
+                assert_eq!(partition_result.incorrect_hash_descriptor_num, None);
+                assert_eq!(partition_result.vbmeta_hashes_match, None);
+                assert_eq!(partition_result.vbmeta_signatures_match, None);
+                assert_eq!(partition_result.partition_info.as_ref().unwrap().partition_hashes_match, false);
+                assert_eq!(partition_result.partition_info.as_ref().unwrap().partition_sizes_match, true);
+            }
+        }
     }
 }
