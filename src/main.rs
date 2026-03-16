@@ -44,6 +44,7 @@ use crate::avb::AvbFooter;
 use crate::avb::AvbHashDescriptorInfo;
 use crate::avb::AvbRSAPublicKey;
 use crate::avb::AvbRSAPublicKeyHeader;
+use crate::avb::AvbVBMetaImageFlags;
 use crate::avb::AvbVBMetaImageHeader;
 use crate::avb::AVB_FOOTER_MAGIC;
 use crate::avb::FOOTER_SIZE;
@@ -363,10 +364,13 @@ struct GeneratedHeaders {
     footer: Option<AvbFooter>,
 }
 
-fn generate_new_header(header: &AvbVBMetaImageHeader, new_descriptors: Vec<AvbDescriptorEnum>, key: Option<RsaPrivateKey>, original_image_size: Option<usize>) -> Result<GeneratedHeaders> {
+fn generate_new_header(header: &AvbVBMetaImageHeader, new_descriptors: Vec<AvbDescriptorEnum>, key: Option<RsaPrivateKey>, original_image_size: Option<usize>, disable_verity: bool) -> Result<GeneratedHeaders> {
     let mut new_header = header.clone();
 
     let algo_type = new_header.algorithm_type;
+    if disable_verity {
+        new_header.flags = new_header.flags | AvbVBMetaImageFlags::AVB_VBMETA_IMAGE_FLAGS_HASHTREE_DISABLED.0;
+    }
     if let Some(key) = &key {
         new_header.hash_offset = 0;
         new_header.hash_size = Hasher::digest_size(algo_type)? as u64;
@@ -461,13 +465,13 @@ fn patch_boot_spl(descriptors_data: &mut Vec<AvbDescriptorEnum>, boot_spl: &str)
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None, after_help = "Example:
  # Patch current slot partitions
- testkey-signer patch-device [--inactive-slot] [--dry-run] [--boot-spl 2025-03-05]
+ testkey-signer patch-device [--inactive-slot] [--dry-run] [--boot-spl 2025-03-05] [--disable-verity]
  # Verify current slot partitions
  testkey-signer verify-device [--inactive-slot]
  # Patch files. Files will be patched in place.
- testkey-signer patch-file boot.img [--boot-spl 2025-03-05]
+ testkey-signer patch-file boot.img [--boot-spl 2025-03-05] [--disable-verity]
  # Can patch multiple files at once. Non-chained partition must be patched simultaneously.
- testkey-signer patch-file vbmeta.img boot.img init_boot.img ... [--boot-spl 2025-03-05]
+ testkey-signer patch-file vbmeta.img boot.img init_boot.img ... [--boot-spl 2025-03-05] [--disable-verity]
  # Just verify files
  testkey-signer verify-file boot.img")]
 struct Args {
@@ -498,6 +502,10 @@ enum Commands {
         /// Patch SPL for boot partition. Format: YYYY-MM-DD
         #[arg(short = 'b', long = "boot-spl")]
         boot_spl: Option<String>,
+
+        /// Disable verity for partition.
+        #[arg(short = 'd', long = "disable-verity")]
+        disable_verity: bool,
     },
     /// Verify current slot partitions.
     VerifyDevice {
@@ -514,6 +522,10 @@ enum Commands {
         /// Patch SPL for boot partition. Format: YYYY-MM-DD.
         #[arg(short = 'b', long = "boot-spl")]
         boot_spl: Option<String>,
+
+        /// Disable verity for partition.
+        #[arg(short = 'd', long = "disable-verity")]
+        disable_verity: bool,
     },
     /// Verify files.
     #[command(arg_required_else_help = true)]
@@ -537,22 +549,23 @@ fn run(args: Args, env: &dyn Environment) -> Result<()> {
             yes,
             dry_run,
             boot_spl,
+            disable_verity
         } => {
-            run_patch_device(env, inactive_slot, yes, dry_run, false, boot_spl)?;
+            run_patch_device(env, inactive_slot, yes, dry_run, false, boot_spl, disable_verity)?;
             return Ok(());
         }
         Commands::VerifyDevice { inactive_slot } => {
-            let result = run_patch_device(env, inactive_slot, false, true, true, None)?;
+            let result = run_patch_device(env, inactive_slot, false, true, true, None, false)?;
             print_verification_result(&result);
 
             return Ok(());
         }
-        Commands::PatchFile { input_filenames, boot_spl } => {
-            run_patch_files(env, input_filenames, false, false, boot_spl)?;
+        Commands::PatchFile { input_filenames, boot_spl, disable_verity } => {
+            run_patch_files(env, input_filenames, false, false, boot_spl, disable_verity)?;
             return Ok(());
         }
         Commands::VerifyFile { input_filenames } => {
-            let result = run_patch_files(env, input_filenames, true, true, None)?;
+            let result = run_patch_files(env, input_filenames, true, true, None, false)?;
             print_verification_result(&result);
 
             return Ok(());
@@ -570,7 +583,7 @@ fn print_verification_result(result: &VerificationResult) {
     println!("Overall result: {}", ok_ng(result.all_ok));
 }
 
-fn run_patch_files(env: &dyn Environment, input_filenames: Vec<String>, dry_run: bool, only_verify: bool, boot_spl: Option<String>) -> Result<VerificationResult> {
+fn run_patch_files(env: &dyn Environment, input_filenames: Vec<String>, dry_run: bool, only_verify: bool, boot_spl: Option<String>, disable_verity: bool) -> Result<VerificationResult> {
     let mut partition_set = HashMap::new();
     let mut vbmeta_idx = None;
     for (i, input_filename) in input_filenames.iter().enumerate() {
@@ -603,7 +616,7 @@ fn run_patch_files(env: &dyn Environment, input_filenames: Vec<String>, dry_run:
         }
     }
 
-    run_patch(env, partition_set, true, dry_run, only_verify, boot_spl)
+    run_patch(env, partition_set, true, dry_run, only_verify, boot_spl, disable_verity)
 }
 
 fn get_test_key(key_num_bits: Option<KeyBits>) -> Result<Option<RsaPrivateKey>> {
@@ -619,7 +632,7 @@ fn get_test_key(key_num_bits: Option<KeyBits>) -> Result<Option<RsaPrivateKey>> 
     }
 }
 
-fn run_patch_device(env: &dyn Environment, inactive_slot: bool, yes: bool, dry_run: bool, only_verify: bool, boot_spl: Option<String>) -> Result<VerificationResult> {
+fn run_patch_device(env: &dyn Environment, inactive_slot: bool, yes: bool, dry_run: bool, only_verify: bool, boot_spl: Option<String>, disable_verity: bool) -> Result<VerificationResult> {
     let slot_suffix = env.get_prop("ro.boot.slot_suffix").unwrap_or_default();
     if !slot_suffix.is_empty() {
         info!("Current slot: {}", slot_suffix.trim_start_matches("_"));
@@ -669,10 +682,10 @@ fn run_patch_device(env: &dyn Environment, inactive_slot: bool, yes: bool, dry_r
         },
     );
 
-    run_patch(env, partition_set, yes, dry_run, only_verify, boot_spl)
+    run_patch(env, partition_set, yes, dry_run, only_verify, boot_spl, disable_verity)
 }
 
-fn run_patch(env: &dyn Environment, partition_set: HashMap<String, Partition>, yes: bool, dry_run: bool, only_verify: bool, boot_spl: Option<String>) -> Result<VerificationResult> {
+fn run_patch(env: &dyn Environment, partition_set: HashMap<String, Partition>, yes: bool, dry_run: bool, only_verify: bool, boot_spl: Option<String>, disable_verity: bool) -> Result<VerificationResult> {
     let mut parsed_vbmeta_list = vec![];
     let mut replace_hash_descriptors = HashMap::new();
     let mut has_non_chained_partition = false;
@@ -712,7 +725,7 @@ fn run_patch(env: &dyn Environment, partition_set: HashMap<String, Partition>, y
             parsed.print_result();
             let parent_descriptors_ok = parsed.incorrect_hash_descriptor_num.expect("Should have incorrect_hash_descriptor_num") == 0;
             info!("Parent descriptors ok: {}", parent_descriptors_ok);
-            let all_ok = parsed.is_valid() && parsed_vbmeta_list.iter().all(|(_, parsed)| parsed.is_valid()) && boot_spl.is_none() && parent_descriptors_ok;
+            let all_ok = parsed.is_valid() && parsed_vbmeta_list.iter().all(|(_, parsed)| parsed.is_valid()) && boot_spl.is_none() && !disable_verity && parent_descriptors_ok;
 
             let mut parsed_headers = HashMap::new();
             parsed_headers.insert(vbmeta.name.clone(), parsed.clone());
@@ -748,7 +761,7 @@ fn run_patch(env: &dyn Environment, partition_set: HashMap<String, Partition>, y
             info!("Generating new VBMeta");
             let testkey = get_test_key(parsed.key_num_bits)?;
 
-            let new_vbmeta = generate_new_header(&parsed.header.header, parsed.new_descriptors, testkey, parsed.partition_info.as_ref().map(|p| p.original_image_size))?;
+            let new_vbmeta = generate_new_header(&parsed.header.header, parsed.new_descriptors, testkey, parsed.partition_info.as_ref().map(|p| p.original_image_size), disable_verity)?;
 
             env.set_writable(&vbmeta_device, vbmeta.is_device)?;
             let mut device_write = env.open_device(&vbmeta_device, true, true)?;
@@ -800,7 +813,7 @@ fn run_patch(env: &dyn Environment, partition_set: HashMap<String, Partition>, y
     for (partition, parsed) in parsed_vbmeta_list.into_iter() {
         info!("Patching {}", partition.path);
         let testkey = get_test_key(parsed.key_num_bits)?;
-        let new_vbmeta = generate_new_header(&parsed.header.header, parsed.new_descriptors, testkey, parsed.partition_info.as_ref().map(|p| p.original_image_size))?;
+        let new_vbmeta = generate_new_header(&parsed.header.header, parsed.new_descriptors, testkey, parsed.partition_info.as_ref().map(|p| p.original_image_size), false)?;
         let Some(footer) = new_vbmeta.footer else {
             return Err(anyhow!("No footer was generated"));
         };
@@ -1082,6 +1095,38 @@ mod tests {
         Err(anyhow!("Prop not found"))
     }
 
+    fn get_vbmeta_flags(tempdir: &Tempdir, data: &[u8]) -> Result<u32> {
+        let tmpfile = tempdir.dir.join("tmp.img");
+        let mut f = std::fs::File::create(&tmpfile).expect("Failed to create tmp.img");
+        f.write_all(data).expect("Failed to write tmp.img");
+        drop(f);
+
+        let output = Command::new("python3")
+            .arg("tests/avbtool.py")
+            .arg("info_image")
+            .arg("--image")
+            .arg(&tmpfile)
+            .output()
+            .expect("Failed to run avbtool");
+
+        assert!(
+            output.status.success(),
+            "avbtool info_image failed\n--- stdout ---\n{}\\n--- stderr ---\\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let output = String::from_utf8_lossy(&output.stdout);
+        for line in output.lines() {
+            let line = line.trim();
+            const PREFIX: &str = "Flags:";
+            if line.starts_with(PREFIX) {
+                return Ok(line.strip_prefix(PREFIX).unwrap().trim_ascii().parse().unwrap());
+            }
+        }
+        Err(anyhow!("Flags not found"))
+    }
+
     #[test]
     fn test_patch_file() {
         let tempdir = Tempdir::new();
@@ -1100,6 +1145,7 @@ mod tests {
                 command: Commands::PatchFile {
                     input_filenames: vec![bootimg.to_str().unwrap().to_string()],
                     boot_spl: None,
+                    disable_verity: false,
                 },
                 log_level: Some("info".to_string()),
             },
@@ -1128,6 +1174,7 @@ mod tests {
                 command: Commands::PatchFile {
                     input_filenames: vec![bootimg.to_str().unwrap().to_string()],
                     boot_spl: None,
+                    disable_verity: false,
                 },
                 log_level: Some("info".to_string()),
             },
@@ -1207,7 +1254,7 @@ mod tests {
         // Patch active slot (_a)
         run(
             Args {
-                command: Commands::PatchDevice { yes: true, inactive_slot: false, dry_run: false, boot_spl: Some("Modified boot spl".to_string()) },
+                command: Commands::PatchDevice { yes: true, inactive_slot: false, dry_run: false, boot_spl: Some("Modified boot spl".to_string()), disable_verity: false },
                 log_level: Some("info".to_string()),
             },
             &mock_env,
@@ -1230,7 +1277,7 @@ mod tests {
         // Patch inactive slot (_b)
         run(
             Args {
-                command: Commands::PatchDevice { yes: true, inactive_slot: true, dry_run: false, boot_spl: Some("Modified boot spl 2".to_string()) },
+                command: Commands::PatchDevice { yes: true, inactive_slot: true, dry_run: false, boot_spl: Some("Modified boot spl 2".to_string()), disable_verity: false },
                 log_level: Some("info".to_string()),
             },
             &mock_env,
@@ -1257,7 +1304,7 @@ mod tests {
         let tempdir = Tempdir::new();
         let (vbmetaimg, bootimg, init_bootimg) = prepare_partition_set(&tempdir);
 
-        let result = run_patch_files(&RealEnvironment {}, vec![vbmetaimg.to_str().unwrap().to_string(), bootimg.to_str().unwrap().to_string(), init_bootimg.to_str().unwrap().to_string()], false, true, None)
+        let result = run_patch_files(&RealEnvironment {}, vec![vbmetaimg.to_str().unwrap().to_string(), bootimg.to_str().unwrap().to_string(), init_bootimg.to_str().unwrap().to_string()], false, true, None, false)
             .expect("Failed to patch files");
         assert!(result.all_ok);
         assert_eq!(result.hash_descriptors_match, Some(true));
@@ -1286,7 +1333,7 @@ mod tests {
         f.write_all(b"tampered").expect("Failed to write boot_mod.img");
         drop(f);
 
-        let result = run_patch_files(&RealEnvironment {}, vec![vbmetaimg.to_str().unwrap().to_string(), bootimg.to_str().unwrap().to_string(), init_bootimg.to_str().unwrap().to_string()], false, true, None)
+        let result = run_patch_files(&RealEnvironment {}, vec![vbmetaimg.to_str().unwrap().to_string(), bootimg.to_str().unwrap().to_string(), init_bootimg.to_str().unwrap().to_string()], false, true, None, false)
             .expect("Failed to patch files");
         assert!(!result.all_ok);
         assert_eq!(result.hash_descriptors_match, Some(true));
@@ -1318,7 +1365,7 @@ mod tests {
         f.write_all(b"tampered").expect("Failed to write init_boot.img");
         drop(f);
 
-        let result = run_patch_files(&RealEnvironment {}, vec![vbmetaimg.to_str().unwrap().to_string(), bootimg.to_str().unwrap().to_string(), init_bootimg.to_str().unwrap().to_string()], false, true, None)
+        let result = run_patch_files(&RealEnvironment {}, vec![vbmetaimg.to_str().unwrap().to_string(), bootimg.to_str().unwrap().to_string(), init_bootimg.to_str().unwrap().to_string()], false, true, None, false)
             .expect("Failed to patch files");
         assert!(!result.all_ok);
         assert_eq!(result.hash_descriptors_match, Some(false));
@@ -1345,5 +1392,30 @@ mod tests {
                 assert_eq!(partition_result.partition_info.as_ref().unwrap().partition_sizes_match, true);
             }
         }
+    }
+
+    #[test]
+    fn test_disable_verity() {
+        let tempdir = Tempdir::new();
+        let (vbmetaimg, bootimg, init_bootimg) = prepare_partition_set(&tempdir);
+        
+        let vbmeta_data = std::fs::read(&vbmetaimg).expect("Failed to read vbmeta.img");
+        let boot_data = std::fs::read(&bootimg).expect("Failed to read boot.img");
+        let init_boot_data = std::fs::read(&init_bootimg).expect("Failed to read init_boot.img");
+        let flags = get_vbmeta_flags(&tempdir, &vbmeta_data).expect("Failed to get vbmeta flags");
+        assert_eq!(flags, 0);
+
+        run_patch_files(&RealEnvironment {}, vec![vbmetaimg.to_str().unwrap().to_string(), bootimg.to_str().unwrap().to_string(), init_bootimg.to_str().unwrap().to_string()], false, false, None, true)
+            .expect("Failed to patch files");
+
+        let vbmeta_data_after = std::fs::read(&vbmetaimg).expect("Failed to read vbmeta.img");
+        let flags = get_vbmeta_flags(&tempdir, &vbmeta_data_after).expect("Failed to get vbmeta flags");
+        assert!(vbmeta_data_after != vbmeta_data);
+        assert_eq!(flags, AvbVBMetaImageFlags::AVB_VBMETA_IMAGE_FLAGS_HASHTREE_DISABLED.0);
+        
+        let boot_data_after = std::fs::read(&bootimg).expect("Failed to read boot.img");
+        let init_boot_data_after = std::fs::read(&init_bootimg).expect("Failed to read init_boot.img");
+        assert!(boot_data_after == boot_data);
+        assert!(init_boot_data_after == init_boot_data);
     }
 }
