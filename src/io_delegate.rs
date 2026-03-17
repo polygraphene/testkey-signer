@@ -6,6 +6,7 @@ use std::collections::HashMap;
 #[cfg(test)]
 use std::sync::{Arc, Mutex};
 
+#[cfg(any(target_os = "android", target_os = "linux"))]
 use std::os::unix::io::AsRawFd;
 
 pub trait IoDelegate: Read + Write + Seek {
@@ -45,19 +46,45 @@ impl Seek for RealDevice {
     }
 }
 
+#[cfg(any(target_os = "android", target_os = "linux"))]
+fn get_size_linux(file: &std::fs::File) -> Result<usize> {
+    const BLKGETSIZE64_CODE: u8 = 0x12; // Defined in linux/fs.h
+    const BLKGETSIZE64_SEQ: u8 = 114;
+    ioctl_read!(ioctl_blkgetsize64, BLKGETSIZE64_CODE, BLKGETSIZE64_SEQ, u64);
+    let mut size64 = 0u64;
+    let size64_ptr = &mut size64 as *mut u64;
+
+    unsafe {
+        ioctl_blkgetsize64(file.as_raw_fd(), size64_ptr)?;
+    }
+    Ok(size64 as usize)
+}
+
+#[cfg(not(any(target_os = "android", target_os = "linux")))]
+fn get_size_linux(_file: &std::fs::File) -> Result<usize> {
+    unimplemented!("get_size is not implemented for non-Linux devices");
+}
+
+#[cfg(any(target_os = "android", target_os = "linux"))]
+fn set_writable_linux(file: &std::fs::File) -> Result<()> {
+    const BLKROSET_CODE: u8 = 0x12;
+    const BLKROSET_SEQ: u8 = 93;
+    ioctl_write_ptr_bad!(ioctl_blkroset, request_code_none!(BLKROSET_CODE, BLKROSET_SEQ), i32);
+    unsafe {
+        ioctl_blkroset(file.as_raw_fd(), &0)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "android", target_os = "linux")))]
+fn set_writable_linux(_file: &std::fs::File) -> Result<()> {
+    unimplemented!("set_writable is not implemented for non-Linux devices");
+}
+
 impl IoDelegate for RealDevice {
     fn get_size(&mut self) -> Result<usize> {
         if self.is_device {
-            const BLKGETSIZE64_CODE: u8 = 0x12; // Defined in linux/fs.h
-            const BLKGETSIZE64_SEQ: u8 = 114;
-            ioctl_read!(ioctl_blkgetsize64, BLKGETSIZE64_CODE, BLKGETSIZE64_SEQ, u64);
-            let mut size64 = 0u64;
-            let size64_ptr = &mut size64 as *mut u64;
-            
-            unsafe {
-                ioctl_blkgetsize64(self.file.as_raw_fd(), size64_ptr)?;
-            }
-            Ok(size64 as usize)
+            get_size_linux(&self.file)
         } else {
             Ok(self.file.metadata()?.len() as usize)
         }
@@ -67,13 +94,7 @@ impl IoDelegate for RealDevice {
         if !self.is_device {
             return Ok(());
         }
-        const BLKROSET_CODE: u8 = 0x12;
-        const BLKROSET_SEQ: u8 = 93;
-        ioctl_write_ptr_bad!(ioctl_blkroset, request_code_none!(BLKROSET_CODE, BLKROSET_SEQ), i32);
-        unsafe {
-            ioctl_blkroset(self.file.as_raw_fd(), &0)?;
-        }
-        Ok(())
+        set_writable_linux(&self.file)
     }
 }
 

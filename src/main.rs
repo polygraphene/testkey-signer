@@ -37,6 +37,7 @@ use clap::Parser;
 use anyhow::Result;
 use anyhow::anyhow;
 
+#[cfg(any(target_os = "android", target_os = "linux"))]
 #[macro_use]
 extern crate nix;
 
@@ -647,7 +648,14 @@ fn run_patch_files(env: &dyn Environment, input_filenames: Vec<String>, dry_run:
         }
     }
 
-    run_patch(env, partition_set, true, dry_run, only_verify, boot_spl, disable_verity)
+    let run_mode = if only_verify {
+        RunMode::VerifyOnly
+    } else if dry_run {
+        RunMode::DryRun
+    } else {
+        RunMode::Patch { yes: true }
+    };
+    run_patch(env, partition_set, run_mode, PatchOptions { boot_spl, disable_verity })
 }
 
 fn get_test_key(key_num_bits: Option<KeyBits>) -> Result<Option<RsaPrivateKey>> {
@@ -713,25 +721,66 @@ fn run_patch_device(env: &dyn Environment, inactive_slot: bool, yes: bool, dry_r
         },
     );
 
-    let mut verification_result = run_patch(env, partition_set, yes, dry_run, only_verify, boot_spl, disable_verity)?;
+    let run_mode = if only_verify {
+        RunMode::VerifyOnly
+    } else if dry_run {
+        RunMode::DryRun
+    } else {
+        RunMode::Patch { yes }
+    };
+    let mut verification_result = run_patch(env, partition_set, run_mode, PatchOptions { boot_spl, disable_verity })?;
     verification_result.slot_suffix = Some(slot_suffix.to_string());
     Ok(verification_result)
 }
 
-fn run_patch(
-    env: &dyn Environment,
-    partition_set: HashMap<String, Partition>,
-    yes: bool,
-    dry_run: bool,
-    only_verify: bool,
+#[derive(Clone, Copy, PartialEq)]
+enum RunMode {
+    VerifyOnly,
+    DryRun,
+    Patch { yes: bool },
+}
+
+#[derive(Clone)]
+struct PatchOptions {
     boot_spl: Option<String>,
     disable_verity: bool,
-) -> Result<VerificationResult> {
+}
+
+fn should_proceed_with_patch(run_mode: RunMode, all_ok: bool) -> Result<bool> {
+    if matches!(run_mode, RunMode::VerifyOnly) {
+        return Ok(false);
+    }
+    if all_ok {
+        info!("Hash and signature are all okay. So no need to re-sign. Exit.");
+        return Ok(false);
+    }
+    if matches!(run_mode, RunMode::DryRun) {
+        info!("Dry run, not writing to devices.");
+        return Ok(false);
+    }
+    info!("Patching device");
+    if let RunMode::Patch { yes: false } = run_mode {
+        print!("Really patch partitions? (y/n) ");
+        std::io::stdout().flush()?;
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        if input.trim() != "y" {
+            println!("Aborted.");
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn parse_other_partitions<'a>(
+    env: &dyn Environment,
+    partition_set: &'a HashMap<String, Partition>,
+    patch_options: &PatchOptions,
+) -> Result<(Vec<(&'a Partition, ParsedHeaders)>, HashMap<String, AvbHashDescriptorInfo>, bool)> {
     let mut parsed_vbmeta_list = vec![];
     let mut replace_hash_descriptors = HashMap::new();
     let mut has_non_chained_partition = false;
 
-    // Parse partitions except vbmeta and collect hash descriptors.
     for partition in partition_set.values() {
         if partition.name == "vbmeta" {
             continue;
@@ -743,27 +792,38 @@ fn run_patch(
             replace_hash_descriptors.insert(partition.name.clone(), parent_vbmeta_hash_descriptor.clone());
             has_non_chained_partition = true;
         }
-        if let Some(boot_spl) = &boot_spl {
+        if let Some(boot_spl) = &patch_options.boot_spl {
             patch_boot_spl(&mut parsed.new_descriptors, boot_spl);
         }
         parsed_vbmeta_list.push((partition, parsed));
     }
 
-    // Parse vbmeta and replace hash descriptors according to collected ones from other partitions.
-    let verification_result = match partition_set.get("vbmeta") {
+    Ok((parsed_vbmeta_list, replace_hash_descriptors, has_non_chained_partition))
+}
+
+fn process_vbmeta_partition(
+    env: &dyn Environment,
+    vbmeta_opt: Option<&Partition>,
+    parsed_vbmeta_list: &[(&Partition, ParsedHeaders)],
+    replace_hash_descriptors: &HashMap<String, AvbHashDescriptorInfo>,
+    has_non_chained_partition: bool,
+    patch_options: &PatchOptions,
+    run_mode: RunMode,
+) -> Result<(VerificationResult, bool)> {
+    match vbmeta_opt {
         Some(vbmeta) => {
             let vbmeta_device = vbmeta.path.clone();
             let mut device = env.open_device(&vbmeta_device, vbmeta.is_device, false)?;
 
             info!("Parsing VBMeta for {vbmeta_device}.");
-            let mut parsed = parse_vbmeta(device.as_mut(), true, Some(&replace_hash_descriptors)).context(format!("Failed to parse VBMeta for {vbmeta_device}"))?;
+            let mut parsed = parse_vbmeta(device.as_mut(), true, Some(replace_hash_descriptors)).context(format!("Failed to parse VBMeta for {vbmeta_device}"))?;
 
             // In case boot partition is non-chained, vbmeta partition also contains the property.
-            if let Some(boot_spl) = &boot_spl {
+            if let Some(boot_spl) = &patch_options.boot_spl {
                 patch_boot_spl(&mut parsed.new_descriptors, boot_spl);
             }
 
-            for (partition, parsed) in &parsed_vbmeta_list {
+            for (partition, parsed) in parsed_vbmeta_list.iter() {
                 info!("=== Partition {} ===", partition.name);
                 parsed.verification_result.print_result();
             }
@@ -775,13 +835,13 @@ fn run_patch(
             // If all verification passed and no modification was requested, exit.
             let all_ok = parsed.verification_result.is_valid()
                 && parsed_vbmeta_list.iter().all(|(_, parsed)| parsed.verification_result.is_valid())
-                && boot_spl.is_none()
-                && !disable_verity
+                && patch_options.boot_spl.is_none()
+                && !patch_options.disable_verity
                 && parent_descriptors_ok;
 
             let mut partition_results = HashMap::new();
             partition_results.insert(vbmeta.name.clone(), parsed.verification_result.clone());
-            for (partition, parsed) in &parsed_vbmeta_list {
+            for (partition, parsed) in parsed_vbmeta_list.iter() {
                 partition_results.insert(partition.name.clone(), parsed.verification_result.clone());
             }
 
@@ -792,27 +852,8 @@ fn run_patch(
                 partition_results,
             };
 
-            if only_verify {
-                return Ok(verification_result);
-            }
-            if all_ok {
-                info!("Hash and signature are all okay. So no need to re-sign. Exit.");
-                return Ok(verification_result);
-            }
-            if dry_run {
-                info!("Dry run, not writing to devices.");
-                return Ok(verification_result);
-            }
-            info!("Patching device");
-            if !yes {
-                print!("Really patch partitions? (y/n)");
-                std::io::stdout().flush()?;
-                let mut input = String::new();
-                std::io::stdin().read_line(&mut input)?;
-                if input.trim() != "y" {
-                    println!("Aborted.");
-                    return Ok(verification_result);
-                }
+            if !should_proceed_with_patch(run_mode, all_ok)? {
+                return Ok((verification_result, false));
             }
 
             // Re-generate VBMeta structures and sign them.
@@ -824,7 +865,7 @@ fn run_patch(
                 parsed.new_descriptors,
                 testkey,
                 parsed.verification_result.partition_info.as_ref().map(|p| p.original_image_size),
-                disable_verity,
+                patch_options.disable_verity,
             )?;
 
             env.set_writable(&vbmeta_device, vbmeta.is_device)?;
@@ -834,21 +875,21 @@ fn run_patch(
 
             warn!("Successfully patched {vbmeta_device}");
 
-            verification_result
+            Ok((verification_result, true))
         }
         None => {
             // No vbmeta file specified.
             if has_non_chained_partition {
-                warn!("No vbmeta file found, but non-chained partitions are present. Skipping VBMeta patching.");
+                warn!("No vbmeta file found, but non-chained partitions are present. Skipping VBMeta patching. This may lead to boot failure.");
             }
-            for (partition, parsed) in &parsed_vbmeta_list {
+            for (partition, parsed) in parsed_vbmeta_list.iter() {
                 info!("Partition {}", partition.name);
                 parsed.verification_result.print_result();
             }
-            let all_ok = parsed_vbmeta_list.iter().all(|(_, parsed)| parsed.verification_result.is_valid()) && boot_spl.is_none();
+            let all_ok = parsed_vbmeta_list.iter().all(|(_, parsed)| parsed.verification_result.is_valid()) && patch_options.boot_spl.is_none();
 
             let mut partition_results = HashMap::new();
-            for (partition, parsed) in &parsed_vbmeta_list {
+            for (partition, parsed) in parsed_vbmeta_list.iter() {
                 partition_results.insert(partition.name.clone(), parsed.verification_result.clone());
             }
             let verification_result = VerificationResult {
@@ -858,31 +899,31 @@ fn run_patch(
                 partition_results,
             };
 
-            if only_verify {
-                return Ok(verification_result);
-            }
-            if all_ok {
-                info!("Hash and signature are all okay. So no need to re-sign. Exit.");
-                return Ok(verification_result);
-            }
-            if dry_run {
-                info!("Dry run, not writing to devices.");
-                return Ok(verification_result);
-            }
-            if !yes {
-                print!("Really patch partitions? (y/n)");
-                std::io::stdout().flush()?;
-                let mut input = String::new();
-                std::io::stdin().read_line(&mut input)?;
-                if input.trim() != "y" {
-                    println!("Aborted.");
-                    return Ok(verification_result);
-                }
+            if !should_proceed_with_patch(run_mode, all_ok)? {
+                return Ok((verification_result, false));
             }
 
-            verification_result
+            Ok((verification_result, true))
         }
-    };
+    }
+}
+
+fn run_patch(env: &dyn Environment, partition_set: HashMap<String, Partition>, run_mode: RunMode, patch_options: PatchOptions) -> Result<VerificationResult> {
+    let (parsed_vbmeta_list, replace_hash_descriptors, has_non_chained_partition) = parse_other_partitions(env, &partition_set, &patch_options)?;
+
+    let (verification_result, proceed) = process_vbmeta_partition(
+        env,
+        partition_set.get("vbmeta"),
+        &parsed_vbmeta_list,
+        &replace_hash_descriptors,
+        has_non_chained_partition,
+        &patch_options,
+        run_mode,
+    )?;
+
+    if !proceed {
+        return Ok(verification_result);
+    }
 
     // Do patching other partitions.
     for (partition, parsed) in parsed_vbmeta_list.into_iter() {
@@ -1211,6 +1252,8 @@ mod tests {
 
     #[test]
     fn test_patch_file() {
+        let _ = env_logger::builder().is_test(true).try_init();
+
         let tempdir = Tempdir::new();
 
         let bootimg = prepare_boot_image(&tempdir);
@@ -1241,6 +1284,7 @@ mod tests {
 
     #[test]
     fn test_patch_init_boot_file() {
+        let _ = env_logger::builder().is_test(true).try_init();
         let tempdir = Tempdir::new();
 
         let bootimg = prepare_init_boot_image(&tempdir);
