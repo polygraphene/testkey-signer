@@ -150,6 +150,14 @@ fn convert_to_avb_pubkey(pubkey: &RsaPublicKey) -> Result<Vec<u8>> {
     Ok(pubkey.to_be_bytes())
 }
 
+fn ok_ng(b: bool) -> &'static str {
+    if b { "OK" } else { "NG" }
+}
+
+fn ok_ng_na(b: Option<bool>) -> &'static str {
+    if let Some(b) = b { ok_ng(b) } else { "N/A" }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum KeyBits {
     Key2048,
@@ -167,12 +175,9 @@ struct PartitionInfo {
 struct ParsedHeaders {
     key_num_bits: Option<KeyBits>,
     header: VBMeta,
-    partition_info: Option<PartitionInfo>,
-    vbmeta_hashes_match: Option<bool>,
-    vbmeta_signatures_match: Option<bool>,
     new_descriptors: Vec<AvbDescriptorEnum>,
     parent_vbmeta_hash_descriptor: Option<AvbHashDescriptorInfo>,
-    incorrect_hash_descriptor_num: Option<usize>,
+    verification_result: PartitionResult,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -181,22 +186,19 @@ struct PartitionResult {
     vbmeta_signatures_match: Option<bool>,
     partition_info: Option<PartitionInfo>,
     incorrect_hash_descriptor_num: Option<usize>,
+    is_testkey: bool,
 }
 
 impl PartitionResult {
     fn is_valid(&self) -> bool {
         self.vbmeta_hashes_match.unwrap_or(true) && self.vbmeta_signatures_match.unwrap_or(true) && self.partition_info.as_ref().map_or(true, |p| p.partition_sizes_match && p.partition_hashes_match)
     }
-}
 
-impl From<&ParsedHeaders> for PartitionResult {
-    fn from(parsed: &ParsedHeaders) -> Self {
-        PartitionResult {
-            vbmeta_hashes_match: parsed.vbmeta_hashes_match,
-            vbmeta_signatures_match: parsed.vbmeta_signatures_match,
-            partition_info: parsed.partition_info,
-            incorrect_hash_descriptor_num: parsed.incorrect_hash_descriptor_num,
-        }
+    fn print_result(&self) {
+        info!("VBMeta Hash: {}", ok_ng_na(self.vbmeta_hashes_match));
+        info!("VBMeta Signature: {}", ok_ng_na(self.vbmeta_signatures_match));
+        info!("Partition Hash: {}", self.partition_info.as_ref().map_or("N/A", |p| ok_ng(p.partition_hashes_match)));
+        info!("Partition Size: {}", self.partition_info.as_ref().map_or("N/A", |p| ok_ng(p.partition_sizes_match)));
     }
 }
 
@@ -210,24 +212,6 @@ struct VerificationResult {
     partition_results: HashMap<String, PartitionResult>,
 }
 
-impl ParsedHeaders {
-    fn is_valid(&self) -> bool {
-        self.vbmeta_hashes_match.unwrap_or(true) && self.vbmeta_signatures_match.unwrap_or(true) && self.partition_info.as_ref().map_or(true, |p| p.partition_sizes_match && p.partition_hashes_match)
-    }
-
-    fn print_result(&self) {
-        let f = |b| if let Some(b) = b { ok_ng(b) } else { "N/A" };
-        info!("VBMeta Hash: {}", f(self.vbmeta_hashes_match));
-        info!("VBMeta Signature: {}", f(self.vbmeta_signatures_match));
-        info!("Partition Hash: {}", self.partition_info.as_ref().map_or("N/A", |p| ok_ng(p.partition_hashes_match)));
-        info!("Partition Size: {}", self.partition_info.as_ref().map_or("N/A", |p| ok_ng(p.partition_sizes_match)));
-    }
-}
-
-fn ok_ng(b: bool) -> &'static str {
-    if b { "OK" } else { "NG" }
-}
-
 fn parse_vbmeta(f: &mut dyn IoDelegate, is_vbmeta: bool, replace_hash_descriptors: Option<&HashMap<String, AvbHashDescriptorInfo>>) -> Result<ParsedHeaders> {
     let vbmeta = VBMeta::from_device(f)?;
 
@@ -239,9 +223,9 @@ fn parse_vbmeta(f: &mut dyn IoDelegate, is_vbmeta: bool, replace_hash_descriptor
     }
 
     let algo_type = vbmeta.header.algorithm_type;
-    let (vbmeta_hashes_match, vbmeta_signatures_match, key_bits) = if algo_type == AvbAlgorithmType::AVB_ALGORITHM_TYPE_NONE as u32 {
+    let (vbmeta_hashes_match, vbmeta_signatures_match, key_bits, is_testkey) = if algo_type == AvbAlgorithmType::AVB_ALGORITHM_TYPE_NONE as u32 {
         // Non chained partition. No verification for hashes or signatures.
-        (None, None, None)
+        (None, None, None, false)
     } else {
         let mut hasher = Hasher::new(algo_type)?;
         hasher.update(&vbmeta.header.to_be_bytes());
@@ -263,7 +247,7 @@ fn parse_vbmeta(f: &mut dyn IoDelegate, is_vbmeta: bool, replace_hash_descriptor
         let e = BigUint::from(PUBLIC_EXPONENT);
         let pubkey = RsaPublicKey::new(n, e)?;
 
-        let verifying_key = VerifyingKey::<rsa::sha2::Sha256>::new(pubkey);
+        let verifying_key = VerifyingKey::<rsa::sha2::Sha256>::new(pubkey.clone());
 
         let sig_value = vbmeta.header.get_signature(&vbmeta.authentication_data)?;
         let signature = rsa::pkcs1v15::Signature::try_from(sig_value)?;
@@ -284,7 +268,10 @@ fn parse_vbmeta(f: &mut dyn IoDelegate, is_vbmeta: bool, replace_hash_descriptor
         } else {
             return Err(anyhow!("Unknown rsa key size: {num_bits}"));
         };
-        (Some(vbmeta_hashes_match), Some(vbmeta_signatures_match), Some(key_bits))
+        let is_testkey = if let Ok(Some(testkey)) = get_test_key(Some(key_bits)) {
+            testkey.to_public_key() == pubkey
+        } else { false };
+        (Some(vbmeta_hashes_match), Some(vbmeta_signatures_match), Some(key_bits), is_testkey)
     };
 
     let original_image = if let Some(footer) = vbmeta.footer {
@@ -383,12 +370,15 @@ fn parse_vbmeta(f: &mut dyn IoDelegate, is_vbmeta: bool, replace_hash_descriptor
     Ok(ParsedHeaders {
         key_num_bits: key_bits,
         header: vbmeta,
-        partition_info: partition_info,
-        vbmeta_hashes_match,
-        vbmeta_signatures_match,
+        verification_result: PartitionResult {
+            vbmeta_hashes_match,
+            vbmeta_signatures_match,
+            partition_info,
+            incorrect_hash_descriptor_num: if replace_hash_descriptors.is_some() { Some(incorrect_hash_descriptor_num) } else { None },
+            is_testkey
+        },
         new_descriptors,
         parent_vbmeta_hash_descriptor,
-        incorrect_hash_descriptor_num: if replace_hash_descriptors.is_some() { Some(incorrect_hash_descriptor_num) } else { None },
     })
 }
 
@@ -728,10 +718,20 @@ fn run_patch_device(env: &dyn Environment, inactive_slot: bool, yes: bool, dry_r
     Ok(verification_result)
 }
 
-fn run_patch(env: &dyn Environment, partition_set: HashMap<String, Partition>, yes: bool, dry_run: bool, only_verify: bool, boot_spl: Option<String>, disable_verity: bool) -> Result<VerificationResult> {
+fn run_patch(
+    env: &dyn Environment,
+    partition_set: HashMap<String, Partition>,
+    yes: bool,
+    dry_run: bool,
+    only_verify: bool,
+    boot_spl: Option<String>,
+    disable_verity: bool,
+) -> Result<VerificationResult> {
     let mut parsed_vbmeta_list = vec![];
     let mut replace_hash_descriptors = HashMap::new();
     let mut has_non_chained_partition = false;
+
+    // Parse partitions except vbmeta and collect hash descriptors.
     for partition in partition_set.values() {
         if partition.name == "vbmeta" {
             continue;
@@ -749,6 +749,7 @@ fn run_patch(env: &dyn Environment, partition_set: HashMap<String, Partition>, y
         parsed_vbmeta_list.push((partition, parsed));
     }
 
+    // Parse vbmeta and replace hash descriptors according to collected ones from other partitions.
     let verification_result = match partition_set.get("vbmeta") {
         Some(vbmeta) => {
             let vbmeta_device = vbmeta.path.clone();
@@ -756,26 +757,40 @@ fn run_patch(env: &dyn Environment, partition_set: HashMap<String, Partition>, y
 
             info!("Parsing VBMeta for {vbmeta_device}.");
             let mut parsed = parse_vbmeta(device.as_mut(), true, Some(&replace_hash_descriptors)).context(format!("Failed to parse VBMeta for {vbmeta_device}"))?;
+
+            // In case boot partition is non-chained, vbmeta partition also contains the property.
             if let Some(boot_spl) = &boot_spl {
                 patch_boot_spl(&mut parsed.new_descriptors, boot_spl);
             }
 
             for (partition, parsed) in &parsed_vbmeta_list {
                 info!("=== Partition {} ===", partition.name);
-                parsed.print_result();
+                parsed.verification_result.print_result();
             }
             info!("=== Partition vbmeta ===");
-            parsed.print_result();
-            let parent_descriptors_ok = parsed.incorrect_hash_descriptor_num.expect("Should have incorrect_hash_descriptor_num") == 0;
+            parsed.verification_result.print_result();
+            let parent_descriptors_ok = parsed.verification_result.incorrect_hash_descriptor_num.expect("Should have incorrect_hash_descriptor_num") == 0;
             info!("Parent descriptors ok: {}", parent_descriptors_ok);
-            let all_ok = parsed.is_valid() && parsed_vbmeta_list.iter().all(|(_, parsed)| parsed.is_valid()) && boot_spl.is_none() && !disable_verity && parent_descriptors_ok;
+
+            // If all verification passed and no modification was requested, exit.
+            let all_ok = parsed.verification_result.is_valid()
+                && parsed_vbmeta_list.iter().all(|(_, parsed)| parsed.verification_result.is_valid())
+                && boot_spl.is_none()
+                && !disable_verity
+                && parent_descriptors_ok;
 
             let mut partition_results = HashMap::new();
-            partition_results.insert(vbmeta.name.clone(), (&parsed).into());
+            partition_results.insert(vbmeta.name.clone(), parsed.verification_result.clone());
             for (partition, parsed) in &parsed_vbmeta_list {
-                partition_results.insert(partition.name.clone(), parsed.into());
+                partition_results.insert(partition.name.clone(), parsed.verification_result.clone());
             }
-            let verification_result = VerificationResult { slot_suffix: None, all_ok, hash_descriptors_match: Some(parent_descriptors_ok), partition_results };
+
+            let verification_result = VerificationResult {
+                slot_suffix: None,
+                all_ok,
+                hash_descriptors_match: Some(parent_descriptors_ok),
+                partition_results,
+            };
 
             if only_verify {
                 return Ok(verification_result);
@@ -804,7 +819,13 @@ fn run_patch(env: &dyn Environment, partition_set: HashMap<String, Partition>, y
             info!("Generating new VBMeta");
             let testkey = get_test_key(parsed.key_num_bits)?;
 
-            let new_vbmeta = generate_new_header(&parsed.header.header, parsed.new_descriptors, testkey, parsed.partition_info.as_ref().map(|p| p.original_image_size), disable_verity)?;
+            let new_vbmeta = generate_new_header(
+                &parsed.header.header,
+                parsed.new_descriptors,
+                testkey,
+                parsed.verification_result.partition_info.as_ref().map(|p| p.original_image_size),
+                disable_verity,
+            )?;
 
             env.set_writable(&vbmeta_device, vbmeta.is_device)?;
             let mut device_write = env.open_device(&vbmeta_device, true, true)?;
@@ -816,26 +837,36 @@ fn run_patch(env: &dyn Environment, partition_set: HashMap<String, Partition>, y
             verification_result
         }
         None => {
+            // No vbmeta file specified.
             if has_non_chained_partition {
                 warn!("No vbmeta file found, but non-chained partitions are present. Skipping VBMeta patching.");
             }
             for (partition, parsed) in &parsed_vbmeta_list {
                 info!("Partition {}", partition.name);
-                parsed.print_result();
+                parsed.verification_result.print_result();
             }
-            let all_ok = parsed_vbmeta_list.iter().all(|(_, parsed)| parsed.is_valid()) && boot_spl.is_none();
+            let all_ok = parsed_vbmeta_list.iter().all(|(_, parsed)| parsed.verification_result.is_valid()) && boot_spl.is_none();
 
             let mut partition_results = HashMap::new();
             for (partition, parsed) in &parsed_vbmeta_list {
-                partition_results.insert(partition.name.clone(), parsed.into());
+                partition_results.insert(partition.name.clone(), parsed.verification_result.clone());
             }
-            let verification_result = VerificationResult { slot_suffix: None, all_ok, hash_descriptors_match: None, partition_results };
+            let verification_result = VerificationResult {
+                slot_suffix: None,
+                all_ok,
+                hash_descriptors_match: None,
+                partition_results,
+            };
 
             if only_verify {
                 return Ok(verification_result);
             }
             if all_ok {
                 info!("Hash and signature are all okay. So no need to re-sign. Exit.");
+                return Ok(verification_result);
+            }
+            if dry_run {
+                info!("Dry run, not writing to devices.");
                 return Ok(verification_result);
             }
             if !yes {
@@ -853,13 +884,21 @@ fn run_patch(env: &dyn Environment, partition_set: HashMap<String, Partition>, y
         }
     };
 
+    // Do patching other partitions.
     for (partition, parsed) in parsed_vbmeta_list.into_iter() {
         info!("Patching {}", partition.path);
         let testkey = get_test_key(parsed.key_num_bits)?;
-        let new_vbmeta = generate_new_header(&parsed.header.header, parsed.new_descriptors, testkey, parsed.partition_info.as_ref().map(|p| p.original_image_size), false)?;
+        let new_vbmeta = generate_new_header(
+            &parsed.header.header,
+            parsed.new_descriptors,
+            testkey,
+            parsed.verification_result.partition_info.as_ref().map(|p| p.original_image_size),
+            false,
+        )?;
         let Some(footer) = new_vbmeta.footer else {
             return Err(anyhow!("No footer was generated"));
         };
+
         env.set_writable(&partition.path, partition.is_device)?;
         let mut device_write = env.open_device(&partition.path, partition.is_device, true)?;
         let filesize = device_write.get_size()?;
@@ -1445,6 +1484,8 @@ mod tests {
 
     #[test]
     fn test_disable_verity() {
+        let _ = env_logger::builder().is_test(true).try_init();
+
         let tempdir = Tempdir::new();
         let (vbmetaimg, bootimg, init_bootimg) = prepare_partition_set(&tempdir);
         
@@ -1466,5 +1507,84 @@ mod tests {
         let init_boot_data_after = std::fs::read(&init_bootimg).expect("Failed to read init_boot.img");
         assert!(boot_data_after == boot_data);
         assert!(init_boot_data_after == init_boot_data);
+    }
+
+    #[test]
+    fn test_is_testkey() {
+        let _ = env_logger::builder().is_test(true).try_init();
+
+        let tempdir = Tempdir::new();
+
+        let tmpfile = tempdir.dir.join("tmp.img");
+
+        let output = Command::new("python3")
+            .arg("tests/avbtool.py")
+            .arg("make_vbmeta_image")
+            .arg("--output")
+            .arg(&tmpfile)
+            .arg("--padding_size")
+            .arg("4096")
+            .arg("--algorithm")
+            .arg("SHA256_RSA4096")
+            .arg("--key")
+            .arg("tests/non-testkey.pem")
+            .arg("--rollback_index")
+            .arg("456")
+            .arg("--prop")
+            .arg("ghi:jkl")
+            .output()
+            .expect("Failed to run avbtool");
+
+        assert!(
+            output.status.success(),
+            "avbtool make_vbmeta_image failed\n--- stdout ---\n{}\\n--- stderr ---\\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let result = run_patch_files(&RealEnvironment {}, vec![tmpfile.to_str().unwrap().to_string()], false, true, None, false).expect("Failed to patch files");
+        assert!(result.all_ok);
+        assert_eq!(result.hash_descriptors_match, Some(true));
+        assert!(result.partition_results.contains_key("vbmeta"));
+        assert_eq!(result.partition_results.get("vbmeta").unwrap().incorrect_hash_descriptor_num, Some(0));
+        assert_eq!(result.partition_results.get("vbmeta").unwrap().vbmeta_hashes_match, Some(true));
+        assert_eq!(result.partition_results.get("vbmeta").unwrap().vbmeta_signatures_match, Some(true));
+        assert!(!result.partition_results.get("vbmeta").unwrap().is_testkey);
+
+        let tmpfile2 = tempdir.dir.join("tmp2.img");
+
+        let output = Command::new("python3")
+            .arg("tests/avbtool.py")
+            .arg("make_vbmeta_image")
+            .arg("--output")
+            .arg(&tmpfile2)
+            .arg("--padding_size")
+            .arg("4096")
+            .arg("--algorithm")
+            .arg("SHA256_RSA4096")
+            .arg("--key")
+            .arg("testkey_rsa4096.pem")
+            .arg("--rollback_index")
+            .arg("456")
+            .arg("--prop")
+            .arg("ghi:jkl")
+            .output()
+            .expect("Failed to run avbtool");
+
+        assert!(
+            output.status.success(),
+            "avbtool make_vbmeta_image failed\n--- stdout ---\n{}\\n--- stderr ---\\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let result = run_patch_files(&RealEnvironment {}, vec![tmpfile2.to_str().unwrap().to_string()], false, true, None, false).expect("Failed to patch files");
+        assert!(result.all_ok);
+        assert_eq!(result.hash_descriptors_match, Some(true));
+        assert!(result.partition_results.contains_key("vbmeta"));
+        assert_eq!(result.partition_results.get("vbmeta").unwrap().incorrect_hash_descriptor_num, Some(0));
+        assert_eq!(result.partition_results.get("vbmeta").unwrap().vbmeta_hashes_match, Some(true));
+        assert_eq!(result.partition_results.get("vbmeta").unwrap().vbmeta_signatures_match, Some(true));
+        assert!(result.partition_results.get("vbmeta").unwrap().is_testkey);
     }
 }
