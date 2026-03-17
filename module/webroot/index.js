@@ -56,13 +56,14 @@ async function run(args) {
             resolve(result);
         });
     });
+    return await promise;
 }
 
 document.getElementById("verify-current-slot").addEventListener("click", async () => {
     document.getElementById("result").innerHTML = "";
     document.getElementById("log").innerHTML = "";
 
-    active_slot_json = await run(['verify-device', '--json']);
+    active_slot_json = JSON.parse(await run(['verify-device', '--json']));
     update();
 });
 
@@ -70,20 +71,24 @@ document.getElementById("verify-inactive-slot").addEventListener("click", async 
     document.getElementById("result").innerHTML = "";
     document.getElementById("log").innerHTML = "";
 
-    inactive_slot_json = await run(['verify-device', '--json', '--inactive-slot']);
+    inactive_slot_json = JSON.parse(await run(['verify-device', '--json', '--inactive-slot']));
     update();
 });
 
-document.getElementById("patch-current-slot").addEventListener("click", () => {
+document.getElementById("patch-current-slot").addEventListener("click", async () => {
     document.getElementById("result").innerHTML = "";
     document.getElementById("log").innerHTML = "";
 
-    run(['patch-device', '--json', '--dry-run']);
+    await run(['patch-device', '--json', '--yes']);
+    active_slot_json = JSON.parse(await run(['verify-device', '--json']));
+    update();
 });
 
-document.getElementById("patch-inactive-slot").addEventListener("click", () => {
+document.getElementById("patch-inactive-slot").addEventListener("click", async () => {
     document.getElementById("result").innerHTML = "";
     document.getElementById("log").innerHTML = "";
 
-    run(['patch-device', '--json', '--inactive-slot', '--dry-run']);
+    await run(['patch-device', '--json', '--inactive-slot', '--yes']);
+    inactive_slot_json = JSON.parse(await run(['verify-device', '--json', '--inactive-slot']));
+    update();
 });
