@@ -48,6 +48,7 @@ struct Partition {
 }
 
 const SUPPORTED_PARTITIONS: [&str; 5] = ["boot", "init_boot", "vendor_boot", "dtbo", "recovery"];
+const BOOT_SPL_PROPERTY: &[u8] = b"com.android.build.boot.security_patch";
 
 fn hex(bin: &[u8]) -> String {
     bin.iter().map(|b| format!("{:02x}", b)).collect()
@@ -89,6 +90,10 @@ fn ok_ng_na(b: Option<bool>) -> &'static str {
     if let Some(b) = b { ok_ng(b) } else { "N/A" }
 }
 
+fn yes_no(b: bool) -> &'static str {
+    if b { "Yes" } else { "No" }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum KeyBits {
     Key2048,
@@ -118,6 +123,7 @@ struct PartitionResult {
     partition_info: Option<PartitionInfo>,
     incorrect_hash_descriptor_num: Option<usize>,
     is_testkey: bool,
+    boot_spl: Option<String>,
 }
 
 impl PartitionResult {
@@ -267,6 +273,15 @@ fn parse_vbmeta(f: &mut dyn IoDelegate, is_vbmeta: bool, replace_hash_descriptor
         }
     }
 
+    let mut boot_spl = None;
+    for descriptor in new_descriptors.iter() {
+        if let AvbDescriptorEnum::Property(property_descriptor) = descriptor {
+            if property_descriptor.key == BOOT_SPL_PROPERTY {
+                boot_spl = Some(String::from_utf8(property_descriptor.value.clone())?);
+            }
+        }
+    }
+
     let partition_info = if let Some((original_image_size, _image_data)) = original_image {
         Some(PartitionInfo {
             original_image_size: original_image_size as usize,
@@ -285,7 +300,8 @@ fn parse_vbmeta(f: &mut dyn IoDelegate, is_vbmeta: bool, replace_hash_descriptor
             vbmeta_signatures_match,
             partition_info,
             incorrect_hash_descriptor_num: if replace_hash_descriptors.is_some() { Some(incorrect_hash_descriptor_num) } else { None },
-            is_testkey
+            is_testkey,
+            boot_spl,
         },
         new_descriptors,
         parent_vbmeta_hash_descriptor,
@@ -312,7 +328,7 @@ fn generate_new_header(header: &AvbVBMetaImageHeader, new_descriptors: Vec<AvbDe
 fn patch_boot_spl(descriptors_data: &mut Vec<AvbDescriptorEnum>, boot_spl: &str) {
     for descriptor in descriptors_data.iter_mut() {
         if let AvbDescriptorEnum::Property(property_descriptor) = descriptor {
-            if property_descriptor.key == b"com.android.build.boot.security_patch" {
+            if property_descriptor.key == BOOT_SPL_PROPERTY {
                 info!("Patching boot security patch from {} to {}", String::from_utf8_lossy(&property_descriptor.value), boot_spl);
                 property_descriptor.value = boot_spl.as_bytes().to_vec();
                 property_descriptor.fix_header();
@@ -459,10 +475,18 @@ fn print_verification_result(result: &VerificationResult, json: bool) {
         return;
     }
     for (partition, result) in result.partition_results.iter() {
-        println!("Partition {}: {}", partition, ok_ng(result.is_valid()));
+        let spl = if let Some(spl) = &result.boot_spl {
+            format!(" [SPL:{}]", spl)
+        } else {
+            String::new()
+        };
+        println!("Partition {}: {}{}", partition, ok_ng(result.is_valid()), spl);
     }
     if let Some(hash_descriptors_match) = result.hash_descriptors_match {
         println!("Matching of vbmeta and other partitions: {}", ok_ng(hash_descriptors_match));
+    }
+    if let Some(vbmata_partition) = result.partition_results.get("vbmeta") {
+        println!("VBMeta is testkey: {}", yes_no(vbmata_partition.is_testkey));
     }
     println!("Overall result: {}", ok_ng(result.all_ok));
 }

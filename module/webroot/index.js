@@ -55,8 +55,16 @@ function update() {
         document.getElementById("signing-status").innerHTML = "<span style='color: red'>Unsupported device. This device is not signed by testkey.</span>" + "<br>";
     } else {
         document.getElementById("signing-status").innerHTML = `Current active slot: ${active_slot_json.slot_suffix}` + "<br>";
-        document.getElementById("signing-status").innerHTML += `Active Slot: <span style="color: ${active_slot_json.all_ok ? 'green' : 'red'}">${ok_ng(active_slot_json.all_ok)}</span>` + "<br>";
-        document.getElementById("signing-status").innerHTML += `Inactive Slot: <span style="color: ${inactive_slot_json.all_ok ? 'green' : 'red'}">${ok_ng(inactive_slot_json.all_ok)}</span>` + "<br>";
+        document.getElementById("signing-status").innerHTML += `Active Slot: <span style="color: ${active_slot_json.all_ok ? 'green' : 'red'}">${ok_ng(active_slot_json.all_ok)}</span>`;
+        if (active_slot_json.partition_results.boot?.boot_spl !== undefined) {
+            document.getElementById("signing-status").innerHTML += `&nbsp;Boot SPL: ${active_slot_json.partition_results.boot.boot_spl}`;
+        }
+        document.getElementById("signing-status").innerHTML += "<br>";
+        document.getElementById("signing-status").innerHTML += `Inactive Slot: <span style="color: ${inactive_slot_json.all_ok ? 'green' : 'red'}">${ok_ng(inactive_slot_json.all_ok)}</span>`;
+        if (inactive_slot_json.partition_results.boot?.boot_spl !== undefined) {
+            document.getElementById("signing-status").innerHTML += `&nbsp;Boot SPL: ${inactive_slot_json.partition_results.boot.boot_spl}`;
+        }
+        document.getElementById("signing-status").innerHTML += "<br>";
         if (active_slot_json.all_ok && inactive_slot_json.all_ok) {
             document.getElementById("signing-status").innerHTML += "<span style='color: green'>All slots are signed. No need for re-sign.</span>" + "<br>";
         }
@@ -111,7 +119,16 @@ document.getElementById("patch-current-slot").addEventListener("click", async ()
     document.getElementById("result").innerHTML = "";
     document.getElementById("log").innerHTML = "";
 
-    await run(['patch-device', '--json', '--yes']);
+    let args = ['patch-device', '--json', '--yes'];
+    if (document.getElementById("verity-disable").checked) {
+        args.push('--disable-verity');
+    }
+    const bootSpl = document.getElementById("boot-spl").value.trim();
+    if (bootSpl) {
+        args.push('--boot-spl', bootSpl);
+    }
+
+    await run(args);
     active_slot_json = JSON.parse(await run(['verify-device', '--json']));
     update();
 });
@@ -121,7 +138,16 @@ document.getElementById("patch-inactive-slot").addEventListener("click", async (
     document.getElementById("result").innerHTML = "";
     document.getElementById("log").innerHTML = "";
 
-    await run(['patch-device', '--json', '--inactive-slot', '--yes']);
+    let args = ['patch-device', '--json', '--inactive-slot', '--yes'];
+    if (document.getElementById("verity-disable").checked) {
+        args.push('--disable-verity');
+    }
+    const bootSpl = document.getElementById("boot-spl").value.trim();
+    if (bootSpl) {
+        args.push('--boot-spl', bootSpl);
+    }
+
+    await run(args);
     inactive_slot_json = JSON.parse(await run(['verify-device', '--json', '--inactive-slot']));
     update();
 });

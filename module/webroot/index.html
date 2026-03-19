@@ -12,9 +12,28 @@
         <div class="button-grid">
             <button id="verify-current-slot">Verify Current Slot</button>
             <button id="verify-inactive-slot">Verify Inactive Slot</button>
-            <button id="patch-current-slot">Patch Current Slot</button>
-            <button id="patch-inactive-slot">Patch Inactive Slot</button>
         </div>
+
+        <details class="patch-options">
+            <summary>Advanced Patch Options</summary>
+            
+            <div class="options-container">
+                <label class="checkbox-label">
+                    <input type="checkbox" id="verity-disable">
+                    Disable Verity
+                </label>
+                
+                <div class="input-group">
+                    <label for="boot-spl">Boot SPL</label>
+                    <input type="text" id="boot-spl" placeholder="e.g. 2024-01-05">
+                </div>
+            </div>
+
+            <div class="button-grid">
+                <button id="patch-current-slot">Patch Current Slot</button>
+                <button id="patch-inactive-slot">Patch Inactive Slot</button>
+            </div>
+        </details>
         <div id="signing-status">Checking signing status...</div>
         <div id="result"></div>
         <div id="log"></div>
