@@ -579,21 +579,29 @@ fn run(args: Args, env: &dyn Environment) -> Result<()> {
             boot_spl,
             disable_verity
         } => {
-            run_patch_device(env, inactive_slot, yes, dry_run, false, boot_spl, disable_verity)?;
+            let run_mode = if dry_run {
+                RunMode::DryRun
+            } else {
+                RunMode::Patch { yes }
+            };
+            run_patch_device(env, inactive_slot, run_mode, PatchOptions { boot_spl, disable_verity })?;
             return Ok(());
         }
         Commands::VerifyDevice { inactive_slot } => {
-            let result = run_patch_device(env, inactive_slot, false, true, true, None, false)?;
+            let run_mode = RunMode::VerifyOnly;
+            let result = run_patch_device(env, inactive_slot, run_mode, PatchOptions { boot_spl: None, disable_verity: false })?;
             print_verification_result(&result, args.json);
 
             return Ok(());
         }
         Commands::PatchFile { input_filenames, boot_spl, disable_verity } => {
-            run_patch_files(env, input_filenames, false, false, boot_spl, disable_verity)?;
+            let run_mode = RunMode::Patch { yes: true };
+            run_patch_files(env, input_filenames, run_mode, PatchOptions { boot_spl, disable_verity })?;
             return Ok(());
         }
         Commands::VerifyFile { input_filenames } => {
-            let result = run_patch_files(env, input_filenames, true, true, None, false)?;
+            let run_mode = RunMode::VerifyOnly;
+            let result = run_patch_files(env, input_filenames, run_mode, PatchOptions { boot_spl: None, disable_verity: false })?;
             print_verification_result(&result, args.json);
 
             return Ok(());
@@ -615,7 +623,7 @@ fn print_verification_result(result: &VerificationResult, json: bool) {
     println!("Overall result: {}", ok_ng(result.all_ok));
 }
 
-fn run_patch_files(env: &dyn Environment, input_filenames: Vec<String>, dry_run: bool, only_verify: bool, boot_spl: Option<String>, disable_verity: bool) -> Result<VerificationResult> {
+fn run_patch_files(env: &dyn Environment, input_filenames: Vec<String>, run_mode: RunMode, patch_options: PatchOptions) -> Result<VerificationResult> {
     let mut partition_set = HashMap::new();
     let mut vbmeta_idx = None;
     for (i, input_filename) in input_filenames.iter().enumerate() {
@@ -648,14 +656,7 @@ fn run_patch_files(env: &dyn Environment, input_filenames: Vec<String>, dry_run:
         }
     }
 
-    let run_mode = if only_verify {
-        RunMode::VerifyOnly
-    } else if dry_run {
-        RunMode::DryRun
-    } else {
-        RunMode::Patch { yes: true }
-    };
-    run_patch(env, partition_set, run_mode, PatchOptions { boot_spl, disable_verity })
+    run_patch(env, partition_set, run_mode, patch_options)
 }
 
 fn get_test_key(key_num_bits: Option<KeyBits>) -> Result<Option<RsaPrivateKey>> {
@@ -671,7 +672,7 @@ fn get_test_key(key_num_bits: Option<KeyBits>) -> Result<Option<RsaPrivateKey>> 
     }
 }
 
-fn run_patch_device(env: &dyn Environment, inactive_slot: bool, yes: bool, dry_run: bool, only_verify: bool, boot_spl: Option<String>, disable_verity: bool) -> Result<VerificationResult> {
+fn run_patch_device(env: &dyn Environment, inactive_slot: bool, run_mode: RunMode, patch_options: PatchOptions) -> Result<VerificationResult> {
     let slot_suffix = env.get_prop("ro.boot.slot_suffix").unwrap_or_default();
     if !slot_suffix.is_empty() {
         info!("Current slot: {}", slot_suffix.trim_start_matches("_"));
@@ -721,14 +722,7 @@ fn run_patch_device(env: &dyn Environment, inactive_slot: bool, yes: bool, dry_r
         },
     );
 
-    let run_mode = if only_verify {
-        RunMode::VerifyOnly
-    } else if dry_run {
-        RunMode::DryRun
-    } else {
-        RunMode::Patch { yes }
-    };
-    let mut verification_result = run_patch(env, partition_set, run_mode, PatchOptions { boot_spl, disable_verity })?;
+    let mut verification_result = run_patch(env, partition_set, run_mode, patch_options)?;
     verification_result.slot_suffix = Some(slot_suffix.to_string());
     Ok(verification_result)
 }
@@ -830,14 +824,16 @@ fn process_vbmeta_partition(
             info!("=== Partition vbmeta ===");
             parsed.verification_result.print_result();
             let parent_descriptors_ok = parsed.verification_result.incorrect_hash_descriptor_num.expect("Should have incorrect_hash_descriptor_num") == 0;
-            info!("Parent descriptors ok: {}", parent_descriptors_ok);
+            info!("Parent descriptors ok: {}", ok_ng(parent_descriptors_ok));
+            info!("Signed by testkey?: {}", ok_ng(parsed.verification_result.is_testkey));
 
             // If all verification passed and no modification was requested, exit.
             let all_ok = parsed.verification_result.is_valid()
                 && parsed_vbmeta_list.iter().all(|(_, parsed)| parsed.verification_result.is_valid())
                 && patch_options.boot_spl.is_none()
                 && !patch_options.disable_verity
-                && parent_descriptors_ok;
+                && parent_descriptors_ok
+                && parsed.verification_result.is_testkey;
 
             let mut partition_results = HashMap::new();
             partition_results.insert(vbmeta.name.clone(), parsed.verification_result.clone());
@@ -1436,7 +1432,7 @@ mod tests {
         let tempdir = Tempdir::new();
         let (vbmetaimg, bootimg, init_bootimg) = prepare_partition_set(&tempdir);
 
-        let result = run_patch_files(&RealEnvironment {}, vec![vbmetaimg.to_str().unwrap().to_string(), bootimg.to_str().unwrap().to_string(), init_bootimg.to_str().unwrap().to_string()], false, true, None, false)
+        let result = run_patch_files(&RealEnvironment {}, vec![vbmetaimg.to_str().unwrap().to_string(), bootimg.to_str().unwrap().to_string(), init_bootimg.to_str().unwrap().to_string()], RunMode::VerifyOnly, PatchOptions { boot_spl: None, disable_verity: false })
             .expect("Failed to patch files");
         assert!(result.all_ok);
         assert_eq!(result.hash_descriptors_match, Some(true));
@@ -1465,7 +1461,7 @@ mod tests {
         f.write_all(b"tampered").expect("Failed to write boot_mod.img");
         drop(f);
 
-        let result = run_patch_files(&RealEnvironment {}, vec![vbmetaimg.to_str().unwrap().to_string(), bootimg.to_str().unwrap().to_string(), init_bootimg.to_str().unwrap().to_string()], false, true, None, false)
+        let result = run_patch_files(&RealEnvironment {}, vec![vbmetaimg.to_str().unwrap().to_string(), bootimg.to_str().unwrap().to_string(), init_bootimg.to_str().unwrap().to_string()], RunMode::VerifyOnly, PatchOptions { boot_spl: None, disable_verity: false })
             .expect("Failed to patch files");
         assert!(!result.all_ok);
         assert_eq!(result.hash_descriptors_match, Some(true));
@@ -1497,7 +1493,7 @@ mod tests {
         f.write_all(b"tampered").expect("Failed to write init_boot.img");
         drop(f);
 
-        let result = run_patch_files(&RealEnvironment {}, vec![vbmetaimg.to_str().unwrap().to_string(), bootimg.to_str().unwrap().to_string(), init_bootimg.to_str().unwrap().to_string()], false, true, None, false)
+        let result = run_patch_files(&RealEnvironment {}, vec![vbmetaimg.to_str().unwrap().to_string(), bootimg.to_str().unwrap().to_string(), init_bootimg.to_str().unwrap().to_string()], RunMode::Patch { yes: true }, PatchOptions { boot_spl: None, disable_verity: false })
             .expect("Failed to patch files");
         assert!(!result.all_ok);
         assert_eq!(result.hash_descriptors_match, Some(false));
@@ -1539,7 +1535,7 @@ mod tests {
         let flags = get_vbmeta_flags(&tempdir, &vbmeta_data).expect("Failed to get vbmeta flags");
         assert_eq!(flags, 0);
 
-        run_patch_files(&RealEnvironment {}, vec![vbmetaimg.to_str().unwrap().to_string(), bootimg.to_str().unwrap().to_string(), init_bootimg.to_str().unwrap().to_string()], false, false, None, true)
+        run_patch_files(&RealEnvironment {}, vec![vbmetaimg.to_str().unwrap().to_string(), bootimg.to_str().unwrap().to_string(), init_bootimg.to_str().unwrap().to_string()], RunMode::Patch { yes: true }, PatchOptions { boot_spl: None, disable_verity: true })
             .expect("Failed to patch files");
 
         let vbmeta_data_after = std::fs::read(&vbmetaimg).expect("Failed to read vbmeta.img");
@@ -1586,8 +1582,8 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
 
-        let result = run_patch_files(&RealEnvironment {}, vec![tmpfile.to_str().unwrap().to_string()], false, true, None, false).expect("Failed to patch files");
-        assert!(result.all_ok);
+        let result = run_patch_files(&RealEnvironment {}, vec![tmpfile.to_str().unwrap().to_string()], RunMode::VerifyOnly, PatchOptions { boot_spl: None, disable_verity: false }).expect("Failed to patch files");
+        assert!(!result.all_ok);
         assert_eq!(result.hash_descriptors_match, Some(true));
         assert!(result.partition_results.contains_key("vbmeta"));
         assert_eq!(result.partition_results.get("vbmeta").unwrap().incorrect_hash_descriptor_num, Some(0));
@@ -1622,7 +1618,7 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
 
-        let result = run_patch_files(&RealEnvironment {}, vec![tmpfile2.to_str().unwrap().to_string()], false, true, None, false).expect("Failed to patch files");
+        let result = run_patch_files(&RealEnvironment {}, vec![tmpfile2.to_str().unwrap().to_string()], RunMode::VerifyOnly, PatchOptions { boot_spl: None, disable_verity: false }).expect("Failed to patch files");
         assert!(result.all_ok);
         assert_eq!(result.hash_descriptors_match, Some(true));
         assert!(result.partition_results.contains_key("vbmeta"));
