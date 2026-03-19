@@ -38,6 +38,8 @@ const HASH_DESCRIPTOR_SIZE: usize = size_of::<AvbHashDescriptor>();
 pub const PUBLIC_EXPONENT: u32 = 65537u32;
 pub const VBMETA_ALIGN: usize = 64;
 const DESCRIPTOR_ALIGN: usize = 8;
+// VBMeta offset alignment.
+const BLOCK_SIZE: usize = 4096;
 
 pub const AVB_ALIGNMENT_SIZE: u32 = 8;
 pub const AVB_RSA2048_NUM_BYTES: u32 = 256;
@@ -2862,6 +2864,8 @@ impl VBMeta {
             footer.magic.copy_from_slice(&AVB_FOOTER_MAGIC[..4]);
             footer.original_image_size = original_image_size as u64;
             footer.vbmeta_offset = original_image_size as u64;
+            // Official avbtool.py aligns vbmeta offset to 4096 bytes.
+            footer.vbmeta_offset += padding_size(footer.vbmeta_offset as usize, BLOCK_SIZE) as u64;
             footer.vbmeta_size = header_bytes.len() as u64 + authentication_data.len() as u64 + auxiliary_data.len() as u64;
             footer.version_major = 1;
             footer.version_minor = 0;

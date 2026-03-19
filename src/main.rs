@@ -1774,7 +1774,32 @@ mod tests {
         .expect("Failed to patch active slot");
 
         let dtbo_data_after = std::fs::read(&dtbo_image).expect("Failed to read dtbo_image");
-        let vbmeta_offset = get_vbmeta_offset(&tempdir, &dtbo_data_after).expect("Failed to get vbmeta offset");
-        assert!(vbmeta_offset % 4096 == 0);
+        let vbmeta_offset_after = get_vbmeta_offset(&tempdir, &dtbo_data_after).expect("Failed to get vbmeta offset");
+        assert!(vbmeta_offset_after % 4096 == 0);
+        assert!(vbmeta_offset == vbmeta_offset_after);
+
+        // Revert to original partition content, and assert whole partition including vbmeta offset are reverted
+        let mut f = std::fs::OpenOptions::new().write(true).open(&dtbo_image).expect("Failed to open dtbo_image");
+        f.write_all(&data[0..100]).expect("Failed to write to dtbo_image");
+        f.flush().expect("Failed to flush dtbo_image");
+        drop(f);
+
+        run(
+            Args {
+                command: Commands::PatchFile { input_filenames: vec![dtbo_image.to_str().unwrap().to_string()], dry_run: false, boot_spl: None, disable_verity: false },
+                log_level: Some("info".to_string()),
+                json: false,
+            },
+            &RealEnvironment {},
+        )
+        .expect("Failed to patch active slot");
+
+        let dtbo_data_after2 = std::fs::read(&dtbo_image).expect("Failed to read dtbo_image");
+        let vbmeta_offset_after2 = get_vbmeta_offset(&tempdir, &dtbo_data_after2).expect("Failed to get vbmeta offset");
+        assert!(vbmeta_offset_after2 % 4096 == 0);
+
+        assert!(data != dtbo_data_after);
+        assert!(data == dtbo_data_after2);
+        assert!(vbmeta_offset == vbmeta_offset_after2);
     }
 }
