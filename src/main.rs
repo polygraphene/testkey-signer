@@ -748,9 +748,13 @@ struct PatchOptions {
     disable_verity: bool,
 }
 
-fn should_proceed_with_patch(run_mode: RunMode, all_ok: bool) -> Result<bool> {
+fn should_proceed_with_patch(run_mode: RunMode, all_ok: bool, is_testkey: Option<bool>) -> Result<bool> {
     if matches!(run_mode, RunMode::VerifyOnly) {
         return Ok(false);
+    }
+    if matches!(is_testkey, Some(false)) {
+        info!("Device is not signed by testkey. Unsupported.");
+        return Err(anyhow!("Unsupported key."));
     }
     if all_ok {
         info!("Hash and signature are all okay. So no need to re-sign. Exit.");
@@ -840,8 +844,7 @@ fn process_vbmeta_partition(
                 && parsed_vbmeta_list.iter().all(|(_, parsed)| parsed.verification_result.is_valid())
                 && patch_options.boot_spl.is_none()
                 && !patch_options.disable_verity
-                && parent_descriptors_ok
-                && parsed.verification_result.is_testkey;
+                && parent_descriptors_ok;
 
             let mut partition_results = HashMap::new();
             partition_results.insert(vbmeta.name.clone(), parsed.verification_result.clone());
@@ -856,7 +859,7 @@ fn process_vbmeta_partition(
                 partition_results,
             };
 
-            if !should_proceed_with_patch(run_mode, all_ok)? {
+            if !should_proceed_with_patch(run_mode, all_ok, Some(parsed.verification_result.is_testkey))? {
                 return Ok((verification_result, false));
             }
 
@@ -903,7 +906,7 @@ fn process_vbmeta_partition(
                 partition_results,
             };
 
-            if !should_proceed_with_patch(run_mode, all_ok)? {
+            if !should_proceed_with_patch(run_mode, all_ok, None)? {
                 return Ok((verification_result, false));
             }
 
@@ -1073,7 +1076,7 @@ mod tests {
         outfile
     }
 
-    fn prepare_partition_set(tempdir: &Tempdir) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+    fn prepare_partition_set(tempdir: &Tempdir, testkey: bool) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
         let boot_image = prepare_boot_image(tempdir);
         let init_boot_image = prepare_init_boot_image(tempdir);
         let outfile = tempdir.dir.join("vbmetaout.img");
@@ -1088,7 +1091,7 @@ mod tests {
             .arg("--algorithm")
             .arg("SHA256_RSA4096")
             .arg("--key")
-            .arg("testkey_rsa4096.pem")
+            .arg(if testkey { "testkey_rsa4096.pem" } else { "tests/non-testkey.pem" })
             .arg("--rollback_index")
             .arg("456")
             .arg("--prop")
@@ -1108,6 +1111,12 @@ mod tests {
         );
 
         (outfile, boot_image, init_boot_image)
+    }
+
+    fn delete_partition_set(tempdir: &Tempdir) {
+        std::fs::remove_file(tempdir.dir.join("vbmetaout.img")).unwrap();
+        std::fs::remove_file(tempdir.dir.join("bootmod.img")).unwrap();
+        std::fs::remove_file(tempdir.dir.join("init_boot_mod.img")).unwrap();
     }
 
     fn verify_file(tempdir: &Tempdir, filename: &str, expected_status: bool) {
@@ -1157,7 +1166,7 @@ mod tests {
     //     std::fs::remove_file(&outfile).expect("Failed to remove tmp_data.img");
     // }
 
-    fn verify_partition_set(tempdir: &Tempdir, vbmeta_data: &[u8], bootimg: &[u8], init_bootimg: &[u8], expected_status: bool) {
+    fn verify_partition_set(tempdir: &Tempdir, vbmeta_data: &[u8], bootimg: &[u8], init_bootimg: &[u8], is_testkey: bool, expected_status: bool) {
         let vbmeta_file = tempdir.dir.join("vbmeta.img");
         std::fs::write(&vbmeta_file, &vbmeta_data).expect("Failed to write mock vbmeta.img");
         let bootimg_file = tempdir.dir.join("boot.img");
@@ -1171,7 +1180,7 @@ mod tests {
             .arg("--image")
             .arg(&vbmeta_file)
             .arg("--key")
-            .arg("testkey_rsa4096.pem")
+            .arg(if is_testkey { "testkey_rsa4096.pem" } else { "tests/non-testkey.pem" })
             .arg("--expected_chain_partition")
             .arg("boot:1:testkey_rsa4096.avbpubkey")
             .arg("--use_partition_name")
@@ -1348,8 +1357,9 @@ mod tests {
 
         let _ = env_logger::builder().is_test(true).try_init();
 
+        const IS_TESTKEY: bool = true;
         let tempdir = Tempdir::new();
-        let (vbmetaimg, bootimg, init_bootimg) = prepare_partition_set(&tempdir);
+        let (vbmetaimg, bootimg, init_bootimg) = prepare_partition_set(&tempdir, IS_TESTKEY);
         let vbmeta_data = std::fs::read(&vbmetaimg).expect("Failed to read vbmeta.img");
         let boot_data = std::fs::read(&bootimg).expect("Failed to read boot.img");
         let init_boot_data = std::fs::read(&init_bootimg).expect("Failed to read init_boot.img");
@@ -1406,8 +1416,8 @@ mod tests {
         let unpatched_init_boot_data_b = binding.get("/dev/block/by-name/init_boot_b").expect("init_boot_b not found").into_inner();
         drop(binding);
 
-        verify_partition_set(&tempdir, &patched_vbmeta_data_a, &patched_boot_data_a, &patched_init_boot_data_a, true);
-        verify_partition_set(&tempdir, &unpatched_vbmeta_data_b, &unpatched_boot_data_b, &unpatched_init_boot_data_b, false);
+        verify_partition_set(&tempdir, &patched_vbmeta_data_a, &patched_boot_data_a, &patched_init_boot_data_a, IS_TESTKEY, true);
+        verify_partition_set(&tempdir, &unpatched_vbmeta_data_b, &unpatched_boot_data_b, &unpatched_init_boot_data_b, IS_TESTKEY, false);
         assert_eq!(get_boot_spl(&tempdir, &patched_boot_data_a).expect("Failed to get boot spl"), "Modified boot spl");
         // Patch inactive slot (_b)
         run(
@@ -1430,8 +1440,8 @@ mod tests {
         let patched_init_boot_data_b = binding.get("/dev/block/by-name/init_boot_b").expect("init_boot_b not found").into_inner();
         drop(binding);
 
-        verify_partition_set(&tempdir, &patched_vbmeta_data_a, &patched_boot_data_a, &patched_init_boot_data_a, true);
-        verify_partition_set(&tempdir, &patched_vbmeta_data_b, &patched_boot_data_b, &patched_init_boot_data_b, true);
+        verify_partition_set(&tempdir, &patched_vbmeta_data_a, &patched_boot_data_a, &patched_init_boot_data_a, IS_TESTKEY, true);
+        verify_partition_set(&tempdir, &patched_vbmeta_data_b, &patched_boot_data_b, &patched_init_boot_data_b, IS_TESTKEY, true);
         assert_eq!(get_boot_spl(&tempdir, &patched_boot_data_b).expect("Failed to get boot spl"), "Modified boot spl 2");
     }
 
@@ -1439,8 +1449,9 @@ mod tests {
     fn test_verify_file() {
         let _ = env_logger::builder().is_test(true).try_init();
 
+        const IS_TESTKEY: bool = true;
         let tempdir = Tempdir::new();
-        let (vbmetaimg, bootimg, init_bootimg) = prepare_partition_set(&tempdir);
+        let (vbmetaimg, bootimg, init_bootimg) = prepare_partition_set(&tempdir, IS_TESTKEY);
 
         let result = run_patch_files(&RealEnvironment {}, vec![vbmetaimg.to_str().unwrap().to_string(), bootimg.to_str().unwrap().to_string(), init_bootimg.to_str().unwrap().to_string()], RunMode::VerifyOnly, PatchOptions { boot_spl: None, disable_verity: false })
             .expect("Failed to patch files");
@@ -1537,7 +1548,7 @@ mod tests {
         let _ = env_logger::builder().is_test(true).try_init();
 
         let tempdir = Tempdir::new();
-        let (vbmetaimg, bootimg, init_bootimg) = prepare_partition_set(&tempdir);
+        let (vbmetaimg, bootimg, init_bootimg) = prepare_partition_set(&tempdir, true);
         
         let vbmeta_data = std::fs::read(&vbmetaimg).expect("Failed to read vbmeta.img");
         let boot_data = std::fs::read(&bootimg).expect("Failed to read boot.img");
@@ -1593,7 +1604,7 @@ mod tests {
         );
 
         let result = run_patch_files(&RealEnvironment {}, vec![tmpfile.to_str().unwrap().to_string()], RunMode::VerifyOnly, PatchOptions { boot_spl: None, disable_verity: false }).expect("Failed to patch files");
-        assert!(!result.all_ok);
+        assert!(result.all_ok);
         assert_eq!(result.hash_descriptors_match, Some(true));
         assert!(result.partition_results.contains_key("vbmeta"));
         assert_eq!(result.partition_results.get("vbmeta").unwrap().incorrect_hash_descriptor_num, Some(0));
@@ -1639,12 +1650,96 @@ mod tests {
     }
 
     #[test]
+    fn test_dont_patch_non_testkey() {
+        use crate::io_delegate::MockDevice;
+
+        let _ = env_logger::builder().is_test(true).try_init();
+
+        let tempdir = Tempdir::new();
+
+        let patch = |is_testkey: bool| {
+            let (vbmetaimg, bootimg, init_bootimg) = prepare_partition_set(&tempdir, is_testkey);
+
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&init_bootimg)
+                .expect("Failed to open init_boot.img")
+                .write_all(b"Tampered")
+                .expect("Failed to write to init_boot.img");
+
+            let vbmeta_data_a = std::fs::read(&vbmetaimg).expect("Failed to read vbmeta.img");
+            let mut boot_data_a = std::fs::read(&bootimg).expect("Failed to read boot.img");
+            let mut init_boot_data_a = std::fs::read(&init_bootimg).expect("Failed to read init_boot.img");
+
+            // Slightly modify them to differ
+            boot_data_a[2] = b'a';
+
+            let init_boot_mod_data = b"It is modified init_boot.img content";
+            init_boot_data_a[0..init_boot_mod_data.len()].copy_from_slice(init_boot_mod_data);
+
+            let mut props = HashMap::new();
+            props.insert("ro.boot.slot_suffix".to_string(), "_a".to_string());
+
+            let mut devices = HashMap::new();
+            devices.insert("/dev/block/by-name/vbmeta_a".to_string(), MockDevice::new(vbmeta_data_a.clone()));
+            devices.insert("/dev/block/by-name/boot_a".to_string(), MockDevice::new(boot_data_a.clone()));
+            devices.insert("/dev/block/by-name/init_boot_a".to_string(), MockDevice::new(init_boot_data_a.clone()));
+
+            let mock_env = MockEnvironment {
+                props,
+                devices: std::sync::Mutex::new(devices),
+            };
+
+            let result = run(
+                Args {
+                    command: Commands::PatchDevice {
+                        yes: true,
+                        inactive_slot: false,
+                        dry_run: false,
+                        boot_spl: Some("Modified boot spl".to_string()),
+                        disable_verity: false,
+                    },
+                    log_level: Some("info".to_string()),
+                    json: false,
+                },
+                &mock_env,
+            );
+            if !is_testkey {
+                assert!(matches!(result, Err(_)));
+            } else {
+                assert!(result.is_ok());
+            }
+
+            let binding = mock_env.devices.lock().unwrap();
+            let vbmeta_data_a_after = binding.get("/dev/block/by-name/vbmeta_a").expect("vbmeta_a not found").into_inner();
+            let boot_data_a_after = binding.get("/dev/block/by-name/boot_a").expect("boot_a not found").into_inner();
+            let init_boot_data_a_after = binding.get("/dev/block/by-name/init_boot_a").expect("init_boot_a not found").into_inner();
+            drop(binding);
+
+            verify_partition_set(&tempdir, &vbmeta_data_a_after, &boot_data_a_after, &init_boot_data_a_after, is_testkey, is_testkey);
+            if !is_testkey {
+                assert!(vbmeta_data_a_after == vbmeta_data_a);
+                assert!(boot_data_a_after == boot_data_a);
+                assert!(init_boot_data_a_after == init_boot_data_a);
+            } else {
+                assert!(vbmeta_data_a_after != vbmeta_data_a);
+                assert!(boot_data_a_after != boot_data_a);
+                assert!(init_boot_data_a_after != init_boot_data_a);
+            }
+            delete_partition_set(&tempdir);
+        };
+
+        patch(false);
+        patch(true);
+    }
+
+    #[test]
     fn test_patch_file_dry_run() {
         let _ = env_logger::builder().is_test(true).try_init();
 
         let tempdir = Tempdir::new();
 
-        let (vbmetaimg, bootimg, init_bootimg) = prepare_partition_set(&tempdir);
+        let (vbmetaimg, bootimg, init_bootimg) = prepare_partition_set(&tempdir, true);
 
         std::fs::OpenOptions::new().write(true).open(&init_bootimg).expect("Failed to open init_boot.img").write_all(b"Tampered").expect("Failed to write to init_boot.img");
         
@@ -1682,8 +1777,9 @@ mod tests {
 
         let _ = env_logger::builder().is_test(true).try_init();
 
+        const IS_TESTKEY: bool = true;
         let tempdir = Tempdir::new();
-        let (vbmetaimg, bootimg, init_bootimg) = prepare_partition_set(&tempdir);
+        let (vbmetaimg, bootimg, init_bootimg) = prepare_partition_set(&tempdir, IS_TESTKEY);
 
         std::fs::OpenOptions::new().write(true).open(&init_bootimg).expect("Failed to open init_boot.img").write_all(b"Tampered").expect("Failed to write to init_boot.img");
         
@@ -1714,7 +1810,7 @@ mod tests {
             devices: std::sync::Mutex::new(devices),
         };
 
-        // Patch active slot (_a)
+        // Patch active slot (_a) with --dry-run
         run(
             Args {
                 command: Commands::PatchDevice { yes: true, inactive_slot: false, dry_run: true, boot_spl: Some("Modified boot spl".to_string()), disable_verity: false },
@@ -1731,12 +1827,12 @@ mod tests {
         let init_boot_data_a_after = binding.get("/dev/block/by-name/init_boot_a").expect("init_boot_a not found").into_inner();
         drop(binding);
 
-        verify_partition_set(&tempdir, &vbmeta_data_a_after, &boot_data_a_after, &init_boot_data_a_after, false);
+        verify_partition_set(&tempdir, &vbmeta_data_a_after, &boot_data_a_after, &init_boot_data_a_after, IS_TESTKEY, false);
         assert!(vbmeta_data_a_after == vbmeta_data_a);
         assert!(boot_data_a_after == boot_data_a);
         assert!(init_boot_data_a_after == init_boot_data_a);
 
-        // Patch active slot (_a)
+        // Patch active slot (_a) without --dry-run
         run(
             Args {
                 command: Commands::PatchDevice { yes: true, inactive_slot: false, dry_run: false, boot_spl: Some("Modified boot spl".to_string()), disable_verity: false },
@@ -1753,7 +1849,7 @@ mod tests {
         let init_boot_data_a_after = binding.get("/dev/block/by-name/init_boot_a").expect("init_boot_a not found").into_inner();
         drop(binding);
 
-        verify_partition_set(&tempdir, &vbmeta_data_a_after, &boot_data_a_after, &init_boot_data_a_after, true);
+        verify_partition_set(&tempdir, &vbmeta_data_a_after, &boot_data_a_after, &init_boot_data_a_after, IS_TESTKEY, true);
         assert!(vbmeta_data_a_after != vbmeta_data_a);
         assert!(boot_data_a_after != boot_data_a);
         assert!(init_boot_data_a_after != init_boot_data_a);
