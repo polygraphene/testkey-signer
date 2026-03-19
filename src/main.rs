@@ -547,6 +547,10 @@ enum Commands {
         /// Input filenames.
         input_filenames: Vec<String>,
 
+        /// Don't write to files, just show what will be done.
+        #[arg(short = 'n', long = "dry-run")]
+        dry_run: bool,
+
         /// Patch SPL for boot partition. Format: YYYY-MM-DD.
         #[arg(short = 'b', long = "boot-spl")]
         boot_spl: Option<String>,
@@ -594,8 +598,12 @@ fn run(args: Args, env: &dyn Environment) -> Result<()> {
 
             return Ok(());
         }
-        Commands::PatchFile { input_filenames, boot_spl, disable_verity } => {
-            let run_mode = RunMode::Patch { yes: true };
+        Commands::PatchFile { input_filenames, dry_run, boot_spl, disable_verity } => {
+            let run_mode = if dry_run {
+                RunMode::DryRun
+            } else {
+                RunMode::Patch { yes: true }
+            };
             run_patch_files(env, input_filenames, run_mode, PatchOptions { boot_spl, disable_verity })?;
             return Ok(());
         }
@@ -1265,6 +1273,7 @@ mod tests {
             Args {
                 command: Commands::PatchFile {
                     input_filenames: vec![bootimg.to_str().unwrap().to_string()],
+                    dry_run: false,
                     boot_spl: None,
                     disable_verity: false,
                 },
@@ -1296,6 +1305,7 @@ mod tests {
             Args {
                 command: Commands::PatchFile {
                     input_filenames: vec![bootimg.to_str().unwrap().to_string()],
+                    dry_run: false,
                     boot_spl: None,
                     disable_verity: false,
                 },
@@ -1626,5 +1636,126 @@ mod tests {
         assert_eq!(result.partition_results.get("vbmeta").unwrap().vbmeta_hashes_match, Some(true));
         assert_eq!(result.partition_results.get("vbmeta").unwrap().vbmeta_signatures_match, Some(true));
         assert!(result.partition_results.get("vbmeta").unwrap().is_testkey);
+    }
+
+    #[test]
+    fn test_patch_file_dry_run() {
+        let _ = env_logger::builder().is_test(true).try_init();
+
+        let tempdir = Tempdir::new();
+
+        let (vbmetaimg, bootimg, init_bootimg) = prepare_partition_set(&tempdir);
+
+        std::fs::OpenOptions::new().write(true).open(&init_bootimg).expect("Failed to open init_boot.img").write_all(b"Tampered").expect("Failed to write to init_boot.img");
+        
+        let vbmeta_data = std::fs::read(&vbmetaimg).expect("Failed to read vbmeta.img");
+        let boot_data = std::fs::read(&bootimg).expect("Failed to read boot.img");
+        let init_boot_data = std::fs::read(&init_bootimg).expect("Failed to read init_boot.img");
+
+        run_patch_files(&RealEnvironment {}, vec![vbmetaimg.to_str().unwrap().to_string(), bootimg.to_str().unwrap().to_string(), init_bootimg.to_str().unwrap().to_string()], RunMode::DryRun, PatchOptions { boot_spl: Some("Dummy".to_string()), disable_verity: true })
+            .expect("Failed to patch files");
+
+        let vbmeta_data_after = std::fs::read(&vbmetaimg).expect("Failed to read vbmeta.img");
+        let boot_data_after = std::fs::read(&bootimg).expect("Failed to read boot.img");
+        let init_boot_data_after = std::fs::read(&init_bootimg).expect("Failed to read init_boot.img");
+
+        assert!(vbmeta_data_after == vbmeta_data);
+        assert!(boot_data_after == boot_data);
+        assert!(init_boot_data_after == init_boot_data);
+
+        run_patch_files(&RealEnvironment {}, vec![vbmetaimg.to_str().unwrap().to_string(), bootimg.to_str().unwrap().to_string(), init_bootimg.to_str().unwrap().to_string()], RunMode::Patch { yes: true }, PatchOptions { boot_spl: Some("Dummy".to_string()), disable_verity: true })
+            .expect("Failed to patch files");
+
+        let vbmeta_data_after = std::fs::read(&vbmetaimg).expect("Failed to read vbmeta.img");
+        let boot_data_after = std::fs::read(&bootimg).expect("Failed to read boot.img");
+        let init_boot_data_after = std::fs::read(&init_bootimg).expect("Failed to read init_boot.img");
+
+        assert!(vbmeta_data_after != vbmeta_data);
+        assert!(boot_data_after != boot_data);
+        assert!(init_boot_data_after != init_boot_data);
+    }
+
+    #[test]
+    fn test_patch_device_dry_run() {
+        use std::collections::HashMap;
+        use crate::io_delegate::MockDevice;
+
+        let _ = env_logger::builder().is_test(true).try_init();
+
+        let tempdir = Tempdir::new();
+        let (vbmetaimg, bootimg, init_bootimg) = prepare_partition_set(&tempdir);
+
+        std::fs::OpenOptions::new().write(true).open(&init_bootimg).expect("Failed to open init_boot.img").write_all(b"Tampered").expect("Failed to write to init_boot.img");
+        
+        let vbmeta_data = std::fs::read(&vbmetaimg).expect("Failed to read vbmeta.img");
+        let boot_data = std::fs::read(&bootimg).expect("Failed to read boot.img");
+        let init_boot_data = std::fs::read(&init_bootimg).expect("Failed to read init_boot.img");
+
+        let vbmeta_data_a = vbmeta_data.clone();
+        let mut boot_data_a = boot_data.clone();
+        let mut init_boot_data_a = init_boot_data.clone();
+
+        // Slightly modify them to differ
+        boot_data_a[2] = b'a';
+
+        let init_boot_mod_data = b"It is modified init_boot.img content";
+        init_boot_data_a[0..init_boot_mod_data.len()].copy_from_slice(init_boot_mod_data);
+
+        let mut props = HashMap::new();
+        props.insert("ro.boot.slot_suffix".to_string(), "_a".to_string());
+
+        let mut devices = HashMap::new();
+        devices.insert("/dev/block/by-name/vbmeta_a".to_string(), MockDevice::new(vbmeta_data_a.clone()));
+        devices.insert("/dev/block/by-name/boot_a".to_string(), MockDevice::new(boot_data_a.clone()));
+        devices.insert("/dev/block/by-name/init_boot_a".to_string(), MockDevice::new(init_boot_data_a.clone()));
+
+        let mock_env = MockEnvironment {
+            props,
+            devices: std::sync::Mutex::new(devices),
+        };
+
+        // Patch active slot (_a)
+        run(
+            Args {
+                command: Commands::PatchDevice { yes: true, inactive_slot: false, dry_run: true, boot_spl: Some("Modified boot spl".to_string()), disable_verity: false },
+                log_level: Some("info".to_string()),
+                json: false,
+            },
+            &mock_env,
+        )
+        .expect("Failed to patch active slot");
+
+        let binding = mock_env.devices.lock().unwrap();
+        let vbmeta_data_a_after = binding.get("/dev/block/by-name/vbmeta_a").expect("vbmeta_a not found").into_inner();
+        let boot_data_a_after = binding.get("/dev/block/by-name/boot_a").expect("boot_a not found").into_inner();
+        let init_boot_data_a_after = binding.get("/dev/block/by-name/init_boot_a").expect("init_boot_a not found").into_inner();
+        drop(binding);
+
+        verify_partition_set(&tempdir, &vbmeta_data_a_after, &boot_data_a_after, &init_boot_data_a_after, false);
+        assert!(vbmeta_data_a_after == vbmeta_data_a);
+        assert!(boot_data_a_after == boot_data_a);
+        assert!(init_boot_data_a_after == init_boot_data_a);
+
+        // Patch active slot (_a)
+        run(
+            Args {
+                command: Commands::PatchDevice { yes: true, inactive_slot: false, dry_run: false, boot_spl: Some("Modified boot spl".to_string()), disable_verity: false },
+                log_level: Some("info".to_string()),
+                json: false,
+            },
+            &mock_env,
+        )
+        .expect("Failed to patch active slot");
+
+        let binding = mock_env.devices.lock().unwrap();
+        let vbmeta_data_a_after = binding.get("/dev/block/by-name/vbmeta_a").expect("vbmeta_a not found").into_inner();
+        let boot_data_a_after = binding.get("/dev/block/by-name/boot_a").expect("boot_a not found").into_inner();
+        let init_boot_data_a_after = binding.get("/dev/block/by-name/init_boot_a").expect("init_boot_a not found").into_inner();
+        drop(binding);
+
+        verify_partition_set(&tempdir, &vbmeta_data_a_after, &boot_data_a_after, &init_boot_data_a_after, true);
+        assert!(vbmeta_data_a_after != vbmeta_data_a);
+        assert!(boot_data_a_after != boot_data_a);
+        assert!(init_boot_data_a_after != init_boot_data_a);
     }
 }
