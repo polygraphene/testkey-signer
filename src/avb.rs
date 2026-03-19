@@ -4,6 +4,10 @@
 #![no_std]
 use std::mem::size_of;
 
+use num_bigint_dig::BigUint;
+use rsa::RsaPublicKey;
+use rsa::pkcs1v15::VerifyingKey;
+use rsa::signature::hazmat::PrehashVerifier;
 use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout};
 
 use anyhow::Result;
@@ -14,6 +18,7 @@ use log::warn;
 use log::error;
 use log::debug;
 
+use crate::hasher::Hasher;
 use crate::io_delegate::IoDelegate;
 use crate::pad_right;
 use crate::padding_size;
@@ -2828,5 +2833,41 @@ impl VBMeta {
     pub fn get_partition_name(f: &mut dyn IoDelegate) -> Result<String> {
         let vbmeta = Self::from_device(f)?;
         vbmeta.partition_name.ok_or(anyhow!("Partition name not found"))
+    }
+
+    pub fn calculate_vbmeta_hash(&self) -> Result<Vec<u8>> {
+        let mut hasher = Hasher::new(self.header.algorithm_type)?;
+        hasher.update(&self.header.to_be_bytes());
+        hasher.update(&self.auxiliary_data);
+        Ok(hasher.finalize())
+    }
+
+    pub fn get_public_key(&self) -> Result<RsaPublicKey> {
+        let public_key = self.header.get_public_key(&self.auxiliary_data)?;
+
+        let public_key = AvbRSAPublicKey::from_bytes(public_key)?;
+
+        let n = BigUint::from_bytes_be(&public_key.modulus);
+        let e = BigUint::from(PUBLIC_EXPONENT);
+        Ok(RsaPublicKey::new(n, e)?)
+    }
+
+    pub fn verify_vbmeta_signature(&self) -> Result<bool> {
+        let hash = self.calculate_vbmeta_hash()?;
+
+        let verifying_key = VerifyingKey::<rsa::sha2::Sha256>::new(self.get_public_key()?);
+
+        let signature = self.header.get_signature(&self.authentication_data)?;
+        let signature = rsa::pkcs1v15::Signature::try_from(signature)?;
+        Ok(match verifying_key.verify_prehash(&hash, &signature) {
+            Ok(_) => {
+                info!("Signature verification Ok");
+                true
+            }
+            Err(e) => {
+                info!("Signature verification Failed: {e}");
+                false
+            }
+        })
     }
 }

@@ -25,11 +25,9 @@ use rsa::RsaPrivateKey;
 use rsa::RsaPublicKey;
 use rsa::pkcs1::DecodeRsaPrivateKey;
 use rsa::pkcs1v15::SigningKey;
-use rsa::pkcs1v15::VerifyingKey;
 use rsa::sha2::Sha256;
 use rsa::signature::SignatureEncoding;
 use rsa::signature::hazmat::PrehashSigner;
-use rsa::signature::hazmat::PrehashVerifier;
 use rsa::traits::PublicKeyParts;
 
 use log::{debug, info, warn, trace};
@@ -51,7 +49,6 @@ use crate::avb::AvbVBMetaImageFlags;
 use crate::avb::AvbVBMetaImageHeader;
 use crate::avb::AVB_FOOTER_MAGIC;
 use crate::avb::FOOTER_SIZE;
-use crate::avb::PUBLIC_EXPONENT;
 use crate::avb::VBMETA_ALIGN;
 use crate::avb::VBMeta;
 
@@ -228,10 +225,7 @@ fn parse_vbmeta(f: &mut dyn IoDelegate, is_vbmeta: bool, replace_hash_descriptor
         // Non chained partition. No verification for hashes or signatures.
         (None, None, None, false)
     } else {
-        let mut hasher = Hasher::new(algo_type)?;
-        hasher.update(&vbmeta.header.to_be_bytes());
-        hasher.update(&vbmeta.auxiliary_data);
-        let hash_calc = hasher.finalize();
+        let hash_calc = vbmeta.calculate_vbmeta_hash()?;
 
         let hash_in_vbmeta = vbmeta.header.get_hash(&vbmeta.authentication_data)?;
 
@@ -240,28 +234,10 @@ fn parse_vbmeta(f: &mut dyn IoDelegate, is_vbmeta: bool, replace_hash_descriptor
             info!("Hashes of VBMeta matched");
         }
 
-        let public_key_data = vbmeta.header.get_public_key(&vbmeta.auxiliary_data)?;
-        let public_key = AvbRSAPublicKey::from_bytes(public_key_data)?;
-        let num_bits = public_key.header.key_num_bits;
+        let vbmeta_signatures_match = vbmeta.verify_vbmeta_signature()?;
 
-        let n = BigUint::from_bytes_be(&public_key.modulus);
-        let e = BigUint::from(PUBLIC_EXPONENT);
-        let pubkey = RsaPublicKey::new(n, e)?;
-
-        let verifying_key = VerifyingKey::<rsa::sha2::Sha256>::new(pubkey.clone());
-
-        let sig_value = vbmeta.header.get_signature(&vbmeta.authentication_data)?;
-        let signature = rsa::pkcs1v15::Signature::try_from(sig_value)?;
-        let vbmeta_signatures_match = match verifying_key.verify_prehash(hash_in_vbmeta, &signature) {
-            Ok(_) => {
-                info!("Signature verification Ok");
-                true
-            }
-            Err(e) => {
-                info!("Signature verification Failed: {e}");
-                false
-            }
-        };
+        let public_key = vbmeta.get_public_key()?;
+        let num_bits = public_key.size() * 8;
         let key_bits = if num_bits == 2048 {
             KeyBits::Key2048
         } else if num_bits == 4096 {
@@ -270,7 +246,7 @@ fn parse_vbmeta(f: &mut dyn IoDelegate, is_vbmeta: bool, replace_hash_descriptor
             return Err(anyhow!("Unknown rsa key size: {num_bits}"));
         };
         let is_testkey = if let Ok(Some(testkey)) = get_test_key(Some(key_bits)) {
-            testkey.to_public_key() == pubkey
+            testkey.to_public_key() == public_key
         } else { false };
         (Some(vbmeta_hashes_match), Some(vbmeta_signatures_match), Some(key_bits), is_testkey)
     };
