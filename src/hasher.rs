@@ -1,6 +1,10 @@
 use sha2::Sha256;
 use sha2::Sha512;
 use sha2::Digest;
+use rsa::RsaPrivateKey;
+use rsa::pkcs1v15::SigningKey;
+use rsa::signature::hazmat::PrehashSigner;
+use rsa::signature::SignatureEncoding;
 
 use anyhow::Result;
 use anyhow::anyhow;
@@ -66,5 +70,23 @@ impl Hasher {
             Hasher::Sha256(h) => h.finalize().to_vec(),
             Hasher::Sha512(h) => h.finalize().to_vec(),
         }
+    }
+}
+
+pub fn sign(key: &RsaPrivateKey, algo_type: u32, message: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
+    let mut hasher = Hasher::new(algo_type)?;
+    hasher.update(message);
+    let hash = hasher.finalize();
+
+    if SHA256_ALGOES.contains(&algo_type) {
+        let signing_key = SigningKey::<Sha256>::new(key.clone());
+        let signature = signing_key.sign_prehash(&hash)?.to_bytes();
+        Ok((hash, signature.to_vec()))
+    } else if SHA512_ALGOES.contains(&algo_type) {
+        let signing_key = SigningKey::<Sha512>::new(key.clone());
+        let signature = signing_key.sign_prehash(&hash)?.to_bytes();
+        Ok((hash, signature.to_vec()))
+    } else {
+        Err(anyhow!("Unknown algorithm type: {}", algo_type))
     }
 }

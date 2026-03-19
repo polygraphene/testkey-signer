@@ -7,7 +7,6 @@ use anyhow::Context;
 use io_delegate::Environment;
 use io_delegate::IoDelegate;
 use io_delegate::RealEnvironment;
-use zerocopy::FromZeros;
 use serde::Serialize;
 use serde::Deserialize;
 
@@ -16,18 +15,8 @@ use std::io::Seek;
 use std::io::Write;
 
 use clap::Subcommand;
-use num_bigint_dig::BigInt;
-use num_bigint_dig::ExtendedGcd;
-use num_traits::ToPrimitive;
-use num_traits::identities::One;
-use rsa::BigUint;
 use rsa::RsaPrivateKey;
-use rsa::RsaPublicKey;
 use rsa::pkcs1::DecodeRsaPrivateKey;
-use rsa::pkcs1v15::SigningKey;
-use rsa::sha2::Sha256;
-use rsa::signature::SignatureEncoding;
-use rsa::signature::hazmat::PrehashSigner;
 use rsa::traits::PublicKeyParts;
 
 use log::{debug, info, warn, trace};
@@ -43,13 +32,9 @@ use crate::avb::AvbAlgorithmType;
 use crate::avb::AvbDescriptorEnum;
 use crate::avb::AvbFooter;
 use crate::avb::AvbHashDescriptorInfo;
-use crate::avb::AvbRSAPublicKey;
-use crate::avb::AvbRSAPublicKeyHeader;
 use crate::avb::AvbVBMetaImageFlags;
 use crate::avb::AvbVBMetaImageHeader;
-use crate::avb::AVB_FOOTER_MAGIC;
 use crate::avb::FOOTER_SIZE;
-use crate::avb::VBMETA_ALIGN;
 use crate::avb::VBMeta;
 
 use crate::hasher::Hasher;
@@ -88,64 +73,12 @@ fn hexdump(bin: &[u8]) -> String {
     result
 }
 
-fn to_fixed_length(val: &BigUint, num_bytes: usize) -> Result<Vec<u8>> {
-    let b = val.to_bytes_be();
-    if b.len() > num_bytes {
-        Err(anyhow!("Too long"))
-    } else {
-        let mut pad = vec![0; num_bytes - b.len()];
-        pad.extend(b);
-        Ok(pad)
-    }
-}
-
 fn padding_size(len: usize, align: usize) -> usize {
     (len + align - 1) / align * align - len
 }
 
 fn pad_right(val: &mut Vec<u8>, align: usize) {
     val.extend(vec![0; padding_size(val.len(), align)]);
-}
-
-fn convert_to_avb_pubkey(pubkey: &RsaPublicKey) -> Result<Vec<u8>> {
-    let num_key_bytes = pubkey.size();
-
-    let modulus_bytes = to_fixed_length(&pubkey.n(), num_key_bytes)?;
-
-    let n_signed = BigInt::from_biguint(num_bigint_dig::Sign::Plus, pubkey.n().clone());
-    let r = BigInt::one() << 32;
-    let egcd = n_signed.extended_gcd(&r);
-
-    let n0inv = if egcd.0.is_one() {
-        let inv = (egcd.1 % &r + &r) % &r;
-        let n0_prime = (&r - inv) % &r;
-        n0_prime.to_biguint()
-    } else {
-        None
-    };
-    let n0inv = match n0inv {
-        Some(s) => match s.to_u32() {
-            Some(s) => s,
-            None => return Err(anyhow!("Failed to calculate n0inv")),
-        },
-        None => return Err(anyhow!("Failed to calculate n0inv")),
-    };
-    let mut pubkey_header = AvbRSAPublicKeyHeader::new_zeroed();
-    pubkey_header.key_num_bits = num_key_bytes as u32 * 8;
-    pubkey_header.n0inv = n0inv;
-
-    let two = BigUint::from(2u8);
-    let exponent = BigUint::from(2 * (num_key_bytes * 8));
-
-    let rr = two.modpow(&exponent, pubkey.n());
-    let rr_bytes = to_fixed_length(&rr, num_key_bytes)?;
-
-    let mut pubkey = AvbRSAPublicKey::default();
-    pubkey.header = pubkey_header;
-    pubkey.modulus = modulus_bytes;
-    pubkey.rr = rr_bytes;
-
-    Ok(pubkey.to_be_bytes())
 }
 
 fn ok_ng(b: bool) -> &'static str {
@@ -366,86 +299,13 @@ struct GeneratedHeaders {
 
 fn generate_new_header(header: &AvbVBMetaImageHeader, new_descriptors: Vec<AvbDescriptorEnum>, key: Option<RsaPrivateKey>, original_image_size: Option<usize>, disable_verity: bool) -> Result<GeneratedHeaders> {
     let mut new_header = header.clone();
+    new_header.flags |= if disable_verity { AvbVBMetaImageFlags::AVB_VBMETA_IMAGE_FLAGS_HASHTREE_DISABLED.0 } else { 0 };
 
-    let algo_type = new_header.algorithm_type;
-    if disable_verity {
-        new_header.flags = new_header.flags | AvbVBMetaImageFlags::AVB_VBMETA_IMAGE_FLAGS_HASHTREE_DISABLED.0;
-    }
-    if let Some(key) = &key {
-        new_header.hash_offset = 0;
-        new_header.hash_size = Hasher::digest_size(algo_type)? as u64;
-        new_header.signature_offset = new_header.hash_size;
-        new_header.signature_size = key.size() as u64;
-    } else {
-        assert!(algo_type == AvbAlgorithmType::AVB_ALGORITHM_TYPE_NONE as u32);
-        new_header.hash_offset = 0;
-        new_header.hash_size = 0;
-        new_header.signature_offset = 0;
-        new_header.signature_size = 0;
-    }
-    let pubkey_bytes = if let Some(key) = &key { convert_to_avb_pubkey(&key.to_public_key())? } else { vec![] };
-
-    new_header.authentication_data_block_size = new_header.signature_offset + new_header.signature_size;
-    let authentication_pad = vec![0; padding_size(new_header.authentication_data_block_size as usize, VBMETA_ALIGN)];
-    new_header.authentication_data_block_size += authentication_pad.len() as u64;
-
-    let mut new_descriptors_data = vec![];
-    for descriptor in new_descriptors {
-        new_descriptors_data.extend(descriptor.to_be_bytes());
-    }
-    new_header.descriptors_offset = 0;
-    new_header.descriptors_size = new_descriptors_data.len() as u64;
-    new_header.public_key_offset = new_header.descriptors_offset + new_header.descriptors_size;
-    new_header.public_key_size = pubkey_bytes.len() as u64;
-    new_header.public_key_metadata_offset = new_header.public_key_offset + new_header.public_key_size;
-    new_header.public_key_metadata_size = 0;
-
-    new_header.auxiliary_data_block_size = new_header.public_key_metadata_offset + new_header.public_key_metadata_size;
-    let auxiliary_pad = vec![0; padding_size(new_header.auxiliary_data_block_size as usize, VBMETA_ALIGN)];
-    new_header.auxiliary_data_block_size += auxiliary_pad.len() as u64;
-
-    let new_header_bytes = new_header.to_be_bytes();
-
-    let (new_hash, new_signature) = if let Some(key) = &key {
-        // Signature target is VBMeta header + Auxiliary data block.
-        let mut hasher = Hasher::new(algo_type)?;
-        hasher.update(&new_header_bytes);
-        hasher.update(&new_descriptors_data);
-        hasher.update(&pubkey_bytes);
-        hasher.update(&auxiliary_pad);
-        let new_hash = hasher.finalize();
-        let signing_key = SigningKey::<Sha256>::new(key.clone());
-        let new_signature = signing_key.sign_prehash(&new_hash)?.to_bytes();
-        (new_hash, new_signature.to_vec())
-    } else {
-        (vec![], vec![])
-    };
-
-    let mut vbmeta_bytes = vec![];
-    vbmeta_bytes.extend_from_slice(&new_header_bytes);
-    vbmeta_bytes.extend(new_hash);
-    vbmeta_bytes.extend(new_signature);
-    vbmeta_bytes.extend(authentication_pad);
-    vbmeta_bytes.extend(new_descriptors_data);
-    vbmeta_bytes.extend(pubkey_bytes);
-    vbmeta_bytes.extend(auxiliary_pad);
-
-    let footer = if let Some(original_image_size) = original_image_size {
-        let mut footer = AvbFooter::new_zeroed();
-        footer.magic.copy_from_slice(&AVB_FOOTER_MAGIC[..4]);
-        footer.original_image_size = original_image_size as u64;
-        footer.vbmeta_offset = original_image_size as u64;
-        footer.vbmeta_size = vbmeta_bytes.len() as u64;
-        footer.version_major = 1;
-        footer.version_minor = 0;
-        Some(footer)
-    } else {
-        None
-    };
+    let vbmeta = VBMeta::new(new_header, key, new_descriptors, original_image_size)?;
 
     Ok(GeneratedHeaders {
-        vbmeta_bytes: vbmeta_bytes,
-        footer: footer,
+        vbmeta_bytes: vbmeta.to_be_bytes(),
+        footer: vbmeta.footer,
     })
 }
 

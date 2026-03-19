@@ -5,9 +5,17 @@
 use std::mem::size_of;
 
 use num_bigint_dig::BigUint;
+use rsa::RsaPrivateKey;
 use rsa::RsaPublicKey;
+use rsa::pkcs1v15::SigningKey;
 use rsa::pkcs1v15::VerifyingKey;
+use rsa::pkcs1::DecodeRsaPrivateKey;
 use rsa::signature::hazmat::PrehashVerifier;
+use rsa::traits::PublicKeyParts;
+use num_bigint_dig::BigInt;
+use num_bigint_dig::ExtendedGcd;
+use num_traits::ToPrimitive;
+use num_traits::identities::One;
 use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout};
 
 use anyhow::Result;
@@ -2733,6 +2741,59 @@ impl AvbDescriptorEnum {
     }
 }
 
+fn to_fixed_length(val: &BigUint, num_bytes: usize) -> Result<Vec<u8>> {
+    let b = val.to_bytes_be();
+    if b.len() > num_bytes {
+        Err(anyhow!("Too long"))
+    } else {
+        let mut pad = vec![0; num_bytes - b.len()];
+        pad.extend(b);
+        Ok(pad)
+    }
+}
+
+fn convert_to_avb_pubkey(pubkey: &RsaPublicKey) -> Result<Vec<u8>> {
+    let num_key_bytes = pubkey.size();
+
+    let modulus_bytes = to_fixed_length(&pubkey.n(), num_key_bytes)?;
+
+    let n_signed = BigInt::from_biguint(num_bigint_dig::Sign::Plus, pubkey.n().clone());
+    let r = BigInt::one() << 32;
+    let egcd = n_signed.extended_gcd(&r);
+
+    let n0inv = if egcd.0.is_one() {
+        let inv = (egcd.1 % &r + &r) % &r;
+        let n0_prime = (&r - inv) % &r;
+        n0_prime.to_biguint()
+    } else {
+        None
+    };
+    let n0inv = match n0inv {
+        Some(s) => match s.to_u32() {
+            Some(s) => s,
+            None => return Err(anyhow!("Failed to calculate n0inv")),
+        },
+        None => return Err(anyhow!("Failed to calculate n0inv")),
+    };
+    let mut pubkey_header = AvbRSAPublicKeyHeader::new_zeroed();
+    pubkey_header.key_num_bits = num_key_bytes as u32 * 8;
+    pubkey_header.n0inv = n0inv;
+
+    let two = BigUint::from(2u8);
+    let exponent = BigUint::from(2 * (num_key_bytes * 8));
+
+    let rr = two.modpow(&exponent, pubkey.n());
+    let rr_bytes = to_fixed_length(&rr, num_key_bytes)?;
+
+    let mut pubkey = AvbRSAPublicKey::default();
+    pubkey.header = pubkey_header;
+    pubkey.modulus = modulus_bytes;
+    pubkey.rr = rr_bytes;
+
+    Ok(pubkey.to_be_bytes())
+}
+
+
 #[derive(Clone)]
 pub struct VBMeta {
     pub header: AvbVBMetaImageHeader,
@@ -2744,6 +2805,82 @@ pub struct VBMeta {
 }
 
 impl VBMeta {
+    pub fn new(base_header: AvbVBMetaImageHeader, key: Option<RsaPrivateKey>, descriptors: Vec<AvbDescriptorEnum>, original_image_size: Option<usize>) -> Result<Self> {
+        let mut header = base_header.clone();
+
+        let algo_type = header.algorithm_type;
+        if let Some(key) = &key {
+            header.hash_offset = 0;
+            header.hash_size = Hasher::digest_size(algo_type)? as u64;
+            header.signature_offset = header.hash_size;
+            header.signature_size = key.size() as u64;
+        } else {
+            assert!(algo_type == AvbAlgorithmType::AVB_ALGORITHM_TYPE_NONE as u32);
+            header.hash_offset = 0;
+            header.hash_size = 0;
+            header.signature_offset = 0;
+            header.signature_size = 0;
+        }
+        let pubkey_bytes = if let Some(key) = &key { convert_to_avb_pubkey(&key.to_public_key())? } else { vec![] };
+
+        header.authentication_data_block_size = header.signature_offset + header.signature_size;
+        let authentication_pad = vec![0; padding_size(header.authentication_data_block_size as usize, VBMETA_ALIGN)];
+        header.authentication_data_block_size += authentication_pad.len() as u64;
+
+        let mut descriptors_data = vec![];
+        for descriptor in &descriptors {
+            descriptors_data.extend(descriptor.to_be_bytes());
+        }
+        header.descriptors_offset = 0;
+        header.descriptors_size = descriptors_data.len() as u64;
+        header.public_key_offset = header.descriptors_offset + header.descriptors_size;
+        header.public_key_size = pubkey_bytes.len() as u64;
+        header.public_key_metadata_offset = header.public_key_offset + header.public_key_size;
+        header.public_key_metadata_size = 0;
+
+        let mut auxiliary_data = descriptors_data;
+        auxiliary_data.extend(pubkey_bytes);
+        pad_right(&mut auxiliary_data, VBMETA_ALIGN);
+
+        header.auxiliary_data_block_size = auxiliary_data.len() as u64;
+
+        let header_bytes = header.to_be_bytes();
+
+        let authentication_data = if let Some(key) = &key {
+            // Signature of VBMeta header + Auxiliary data block.
+            let (hash, signature) = crate::hasher::sign(key, algo_type, &[&header_bytes[..], &auxiliary_data[..]].concat())?;
+
+            let mut authentication_data: Vec<u8> = hash;
+            authentication_data.extend(signature);
+            pad_right(&mut authentication_data, VBMETA_ALIGN);
+            authentication_data
+        } else {
+            vec![]
+        };
+        let (footer, partition_name) = if let Some(original_image_size) = original_image_size {
+            let mut footer = AvbFooter::new_zeroed();
+            footer.magic.copy_from_slice(&AVB_FOOTER_MAGIC[..4]);
+            footer.original_image_size = original_image_size as u64;
+            footer.vbmeta_offset = original_image_size as u64;
+            footer.vbmeta_size = header_bytes.len() as u64 + authentication_data.len() as u64 + auxiliary_data.len() as u64;
+            footer.version_major = 1;
+            footer.version_minor = 0;
+            let partition_name = Self::find_partition_name(&descriptors);
+            (Some(footer), partition_name)
+        } else {
+            (None, None)
+        };
+
+        Ok(Self {
+            header,
+            authentication_data,
+            auxiliary_data,
+            descriptors,
+            footer,
+            partition_name,
+        })
+    }
+
     pub fn from_device(f: &mut dyn IoDelegate) -> Result<Self> {
         use std::io::SeekFrom;
 
@@ -2810,16 +2947,7 @@ impl VBMeta {
 
             offset += AVB_DESCRIPTOR_SIZE + num_bytes_following as usize;
         }
-        let partition_name = if footer.is_some() {
-            descriptors.iter().find_map(|descriptor| {
-                if let AvbDescriptorEnum::Hash(hash_descriptor_info) = descriptor {
-                    return Some(String::from_utf8(hash_descriptor_info.partition_name.to_vec()).ok()?);
-                }
-                None
-            })
-        } else {
-            None
-        };
+        let partition_name = if footer.is_some() { Self::find_partition_name(&descriptors) } else { None };
         Ok(Self {
             header,
             authentication_data,
@@ -2828,6 +2956,23 @@ impl VBMeta {
             footer,
             partition_name,
         })
+    }
+
+    fn find_partition_name(descriptors: &Vec<AvbDescriptorEnum>) -> Option<String> {
+        descriptors.iter().find_map(|descriptor| {
+            if let AvbDescriptorEnum::Hash(hash_descriptor_info) = descriptor {
+                return Some(String::from_utf8(hash_descriptor_info.partition_name.to_vec()).ok()?);
+            }
+            None
+        })
+    }
+
+    pub fn to_be_bytes(&self) -> Vec<u8> {
+        let mut vbmeta_bytes = vec![];
+        vbmeta_bytes.extend_from_slice(&self.header.to_be_bytes());
+        vbmeta_bytes.extend_from_slice(&self.authentication_data);
+        vbmeta_bytes.extend_from_slice(&self.auxiliary_data);
+        vbmeta_bytes
     }
 
     pub fn get_partition_name(f: &mut dyn IoDelegate) -> Result<String> {
