@@ -5,6 +5,37 @@ const BASE = "/data/adb/modules/testkey-signer"
 let active_slot_json;
 let inactive_slot_json;
 
+const showDialog = (message) => {
+    return new Promise((resolve) => {
+        const overlay = document.getElementById('custom-dialog-overlay');
+        const messageEl = document.getElementById('custom-dialog-message');
+        const btnOk = document.getElementById('custom-dialog-ok');
+        const btnCancel = document.getElementById('custom-dialog-cancel');
+
+        messageEl.innerText = message;
+        overlay.classList.remove('hidden');
+
+        const cleanup = () => {
+            btnOk.removeEventListener('click', onOk);
+            btnCancel.removeEventListener('click', onCancel);
+            overlay.classList.add('hidden');
+        };
+
+        const onOk = () => {
+            cleanup();
+            resolve(true);
+        };
+
+        const onCancel = () => {
+            cleanup();
+            resolve(false);
+        };
+
+        btnOk.addEventListener('click', onOk);
+        btnCancel.addEventListener('click', onCancel);
+    });
+};
+
 window.onload = async () => {
     await exec(`chmod 700 ${BASE}/testkey-signer`);
 
@@ -76,6 +107,7 @@ document.getElementById("verify-inactive-slot").addEventListener("click", async 
 });
 
 document.getElementById("patch-current-slot").addEventListener("click", async () => {
+    if (!(await showDialog("Are you sure you want to patch the current slot?"))) return;
     document.getElementById("result").innerHTML = "";
     document.getElementById("log").innerHTML = "";
 
@@ -85,6 +117,7 @@ document.getElementById("patch-current-slot").addEventListener("click", async ()
 });
 
 document.getElementById("patch-inactive-slot").addEventListener("click", async () => {
+    if (!(await showDialog("Are you sure you want to patch the inactive slot?"))) return;
     document.getElementById("result").innerHTML = "";
     document.getElementById("log").innerHTML = "";
 

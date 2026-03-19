@@ -137,3 +137,58 @@ button:focus {
         grid-template-columns: 1fr;
     }
 }
+
+.dialog-overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background: rgba(0, 0, 0, 0.7);
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    z-index: 1000;
+    opacity: 1;
+    transition: opacity 0.3s ease;
+}
+
+.dialog-overlay.hidden {
+    opacity: 0;
+    pointer-events: none;
+}
+
+.dialog-box {
+    background: var(--card-bg);
+    padding: 2rem;
+    border-radius: var(--border-radius);
+    text-align: center;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+    max-width: 400px;
+    width: 90%;
+}
+
+.dialog-box p {
+    margin-bottom: 1.5rem;
+    font-size: 1.1rem;
+}
+
+.dialog-buttons {
+    display: flex;
+    gap: 1rem;
+    justify-content: center;
+}
+
+.dialog-buttons button {
+    padding: 0.8rem 1.5rem;
+    font-size: 1rem;
+    flex: 1;
+}
+
+.cancel-btn {
+    background: #424242 !important;
+}
+
+.cancel-btn:hover {
+    background: #505050 !important;
+}
