@@ -973,6 +973,44 @@ mod tests {
         (outfile, boot_image, init_boot_image)
     }
 
+    fn prepare_unaligned_dtbo_image(tempdir: &Tempdir) -> std::path::PathBuf {
+        let outfile = tempdir.dir.join("dtbo_mod.img");
+        let mut f = std::fs::File::create_new(&outfile).expect("Failed to create dtbo_mod.img");
+        let mut data = b"dtbo testdata".to_vec();
+        data.extend(vec![0; 4096 * 10]);
+        f.write_all(&data).expect("Failed to write dtbo_mod.img");
+        drop(f);
+
+        let output = Command::new("python3")
+            .arg("tests/avbtool.py")
+            .arg("add_hash_footer")
+            .arg("--image")
+            .arg(&outfile)
+            .arg("--partition_size")
+            .arg((4096 * 30).to_string())
+            .arg("--partition_name")
+            .arg("dtbo")
+            .arg("--algorithm")
+            .arg("NONE")
+            .arg("--salt")
+            .arg(SALT)
+            .arg("--rollback_index")
+            .arg("123")
+            .arg("--prop")
+            .arg("abc:def")
+            .output()
+            .expect("Failed to run avbtool");
+
+        assert!(
+            output.status.success(),
+            "avbtool failed\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        outfile
+    }
+
     fn delete_partition_set(tempdir: &Tempdir) {
         std::fs::remove_file(tempdir.dir.join("vbmetaout.img")).unwrap();
         std::fs::remove_file(tempdir.dir.join("bootmod.img")).unwrap();
@@ -1059,7 +1097,7 @@ mod tests {
         std::fs::remove_file(&init_bootimg_file).expect("Failed to remove init_boot.img");
     }
 
-    fn get_boot_spl(tempdir: &Tempdir, data: &[u8]) -> Result<String> {
+    fn do_info_image(tempdir: &Tempdir, data: &[u8]) -> Result<String> {
         let tmpfile = tempdir.dir.join("tmp.img");
         let mut f = std::fs::File::create(&tmpfile).expect("Failed to create tmp.img");
         f.write_all(data).expect("Failed to write tmp.img");
@@ -1075,12 +1113,16 @@ mod tests {
 
         assert!(
             output.status.success(),
-            "avbtool info_image failed\n--- stdout ---\n{}\\n--- stderr ---\\n{}",
+            "avbtool info_image failed\n--- stdout ---\n{}\n--- stderr ---\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
 
-        let output = String::from_utf8_lossy(&output.stdout);
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    }
+
+    fn get_boot_spl(tempdir: &Tempdir, data: &[u8]) -> Result<String> {
+        let output = do_info_image(tempdir, data)?;
         for line in output.lines() {
             let line = line.trim();
             const PREFIX: &str = "Prop: com.android.build.boot.security_patch -> '";
@@ -1092,27 +1134,7 @@ mod tests {
     }
 
     fn get_vbmeta_flags(tempdir: &Tempdir, data: &[u8]) -> Result<u32> {
-        let tmpfile = tempdir.dir.join("tmp.img");
-        let mut f = std::fs::File::create(&tmpfile).expect("Failed to create tmp.img");
-        f.write_all(data).expect("Failed to write tmp.img");
-        drop(f);
-
-        let output = Command::new("python3")
-            .arg("tests/avbtool.py")
-            .arg("info_image")
-            .arg("--image")
-            .arg(&tmpfile)
-            .output()
-            .expect("Failed to run avbtool");
-
-        assert!(
-            output.status.success(),
-            "avbtool info_image failed\n--- stdout ---\n{}\\n--- stderr ---\\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-
-        let output = String::from_utf8_lossy(&output.stdout);
+        let output = do_info_image(tempdir, data)?;
         for line in output.lines() {
             let line = line.trim();
             const PREFIX: &str = "Flags:";
@@ -1121,6 +1143,18 @@ mod tests {
             }
         }
         Err(anyhow!("Flags not found"))
+    }
+
+    fn get_vbmeta_offset(tempdir: &Tempdir, data: &[u8]) -> Result<u32> {
+        let output = do_info_image(tempdir, data)?;
+        for line in output.lines() {
+            let line = line.trim();
+            const PREFIX: &str = "VBMeta offset:";
+            if line.starts_with(PREFIX) {
+                return Ok(line.strip_prefix(PREFIX).unwrap().trim_ascii().parse().unwrap());
+            }
+        }
+        Err(anyhow!("VBMeta offset not found"))
     }
 
     #[test]
@@ -1713,5 +1747,34 @@ mod tests {
         assert!(vbmeta_data_a_after != vbmeta_data_a);
         assert!(boot_data_a_after != boot_data_a);
         assert!(init_boot_data_a_after != init_boot_data_a);
+    }
+
+    #[test]
+    fn test_file_padding() {
+        let _ = env_logger::builder().is_test(true).try_init();
+
+        let tempdir = Tempdir::new();
+        let dtbo_image = prepare_unaligned_dtbo_image(&tempdir);
+        let data = std::fs::read(&dtbo_image).expect("Failed to read dtbo_image");
+        let vbmeta_offset = get_vbmeta_offset(&tempdir, &data).expect("Failed to get vbmeta offset");
+        assert!(vbmeta_offset % 4096 == 0);
+        let mut f = std::fs::OpenOptions::new().write(true).open(&dtbo_image).expect("Failed to open dtbo_image");
+        f.write_all(b"Tampered").expect("Failed to write to dtbo_image");
+        f.flush().expect("Failed to flush dtbo_image");
+        drop(f);
+
+        run(
+            Args {
+                command: Commands::PatchFile { input_filenames: vec![dtbo_image.to_str().unwrap().to_string()], dry_run: false, boot_spl: None, disable_verity: false },
+                log_level: Some("info".to_string()),
+                json: false,
+            },
+            &RealEnvironment {},
+        )
+        .expect("Failed to patch active slot");
+
+        let dtbo_data_after = std::fs::read(&dtbo_image).expect("Failed to read dtbo_image");
+        let vbmeta_offset = get_vbmeta_offset(&tempdir, &dtbo_data_after).expect("Failed to get vbmeta offset");
+        assert!(vbmeta_offset % 4096 == 0);
     }
 }
