@@ -1383,6 +1383,133 @@ mod tests {
     }
 
     #[test]
+    fn test_patch_device_slots_ensure_no_write() {
+        use std::collections::HashMap;
+        use crate::io_delegate::MockDevice;
+
+        let _ = env_logger::builder().is_test(true).try_init();
+
+        const IS_TESTKEY: bool = true;
+        let tempdir = Tempdir::new();
+        let (vbmetaimg, bootimg, init_bootimg) = prepare_partition_set(&tempdir, IS_TESTKEY);
+        let vbmeta_data = std::fs::read(&vbmetaimg).expect("Failed to read vbmeta.img");
+        let boot_data = std::fs::read(&bootimg).expect("Failed to read boot.img");
+        let init_boot_data = std::fs::read(&init_bootimg).expect("Failed to read init_boot.img");
+
+        let vbmeta_data_a = vbmeta_data.clone();
+        let mut boot_data_a = boot_data.clone();
+
+        // Slightly modify them to differ
+        // Only affect boot_a
+        boot_data_a[2] = b'a';
+
+        let mut props = HashMap::new();
+        props.insert("ro.boot.slot_suffix".to_string(), "_a".to_string());
+
+        let mut devices = HashMap::new();
+        devices.insert("/dev/block/by-name/vbmeta_a".to_string(), MockDevice::new(vbmeta_data_a.clone()));
+        devices.insert("/dev/block/by-name/boot_a".to_string(), MockDevice::new(boot_data_a.clone()));
+        devices.insert("/dev/block/by-name/init_boot_a".to_string(), MockDevice::new(init_boot_data.clone()));
+
+        let mock_env = MockEnvironment {
+            props,
+            devices: std::sync::Mutex::new(devices),
+        };
+
+        run(
+            Args {
+                command: Commands::PatchDevice { yes: true, inactive_slot: false, dry_run: false, boot_spl: Some("Modified boot spl".to_string()), disable_verity: false },
+                log_level: Some("info".to_string()),
+                json: false,
+            },
+            &mock_env,
+        )
+        .expect("Failed to patch active slot");
+
+        let binding = mock_env.devices.lock().unwrap();
+        let patched_vbmeta_data_a = binding.get("/dev/block/by-name/vbmeta_a").expect("vbmeta_a not found").into_inner();
+        let patched_boot_data_a = binding.get("/dev/block/by-name/boot_a").expect("boot_a not found").into_inner();
+        let patched_init_boot_data_a = binding.get("/dev/block/by-name/init_boot_a").expect("init_boot_a not found").into_inner();
+
+        // Only boot_a should be patched
+        assert_eq!(patched_vbmeta_data_a, vbmeta_data);
+        assert!(patched_boot_data_a != boot_data);
+        assert_eq!(patched_init_boot_data_a, init_boot_data);
+        assert!(!binding.get("/dev/block/by-name/vbmeta_a").expect("vbmeta_a not found").is_dirty());
+        assert!(binding.get("/dev/block/by-name/boot_a").expect("boot_a not found").is_dirty());
+        assert!(!binding.get("/dev/block/by-name/init_boot_a").expect("init_boot_a not found").is_dirty());
+        drop(binding);
+
+        verify_partition_set(&tempdir, &patched_vbmeta_data_a, &patched_boot_data_a, &patched_init_boot_data_a, IS_TESTKEY, true);
+        assert_eq!(get_boot_spl(&tempdir, &patched_boot_data_a).expect("Failed to get boot spl"), "Modified boot spl");
+
+        delete_partition_set(&tempdir);
+    }
+
+    #[test]
+    fn test_patch_device_slots_ensure_no_write_non_chained() {
+        use std::collections::HashMap;
+        use crate::io_delegate::MockDevice;
+
+        let _ = env_logger::builder().is_test(true).try_init();
+
+        const IS_TESTKEY: bool = true;
+        let tempdir = Tempdir::new();
+        let (vbmetaimg, bootimg, init_bootimg) = prepare_partition_set(&tempdir, IS_TESTKEY);
+        let vbmeta_data = std::fs::read(&vbmetaimg).expect("Failed to read vbmeta.img");
+        let boot_data = std::fs::read(&bootimg).expect("Failed to read boot.img");
+        let init_boot_data = std::fs::read(&init_bootimg).expect("Failed to read init_boot.img");
+
+        let vbmeta_data_a = vbmeta_data.clone();
+        let mut init_boot_data_a = init_boot_data.clone();
+
+        // Slightly modify them to differ
+        // Only modify init_boot_a which should lead to patching of init_boot and vbmeta.
+        init_boot_data_a[2] = b'a';
+
+        let mut props = HashMap::new();
+        props.insert("ro.boot.slot_suffix".to_string(), "_a".to_string());
+
+        let mut devices = HashMap::new();
+        devices.insert("/dev/block/by-name/vbmeta_a".to_string(), MockDevice::new(vbmeta_data_a.clone()));
+        devices.insert("/dev/block/by-name/boot_a".to_string(), MockDevice::new(boot_data.clone()));
+        devices.insert("/dev/block/by-name/init_boot_a".to_string(), MockDevice::new(init_boot_data_a.clone()));
+
+        let mock_env = MockEnvironment {
+            props,
+            devices: std::sync::Mutex::new(devices),
+        };
+
+        run(
+            Args {
+                command: Commands::PatchDevice { yes: true, inactive_slot: false, dry_run: false, boot_spl: None, disable_verity: false },
+                log_level: Some("info".to_string()),
+                json: false,
+            },
+            &mock_env,
+        )
+        .expect("Failed to patch active slot");
+
+        let binding = mock_env.devices.lock().unwrap();
+        let patched_vbmeta_data_a = binding.get("/dev/block/by-name/vbmeta_a").expect("vbmeta_a not found").into_inner();
+        let patched_boot_data_a = binding.get("/dev/block/by-name/boot_a").expect("boot_a not found").into_inner();
+        let patched_init_boot_data_a = binding.get("/dev/block/by-name/init_boot_a").expect("init_boot_a not found").into_inner();
+
+        // Only init_boot_a and vbmeta_a should be patched
+        assert!(patched_vbmeta_data_a != vbmeta_data);
+        assert!(patched_boot_data_a == boot_data);
+        assert!(patched_init_boot_data_a != init_boot_data);
+        assert!(binding.get("/dev/block/by-name/vbmeta_a").expect("vbmeta_a not found").is_dirty());
+        assert!(!binding.get("/dev/block/by-name/boot_a").expect("boot_a not found").is_dirty());
+        assert!(binding.get("/dev/block/by-name/init_boot_a").expect("init_boot_a not found").is_dirty());
+        drop(binding);
+
+        verify_partition_set(&tempdir, &patched_vbmeta_data_a, &patched_boot_data_a, &patched_init_boot_data_a, IS_TESTKEY, true);
+
+        delete_partition_set(&tempdir);
+    }
+
+    #[test]
     fn test_verify_file() {
         let _ = env_logger::builder().is_test(true).try_init();
 
@@ -1651,18 +1778,24 @@ mod tests {
             let vbmeta_data_a_after = binding.get("/dev/block/by-name/vbmeta_a").expect("vbmeta_a not found").into_inner();
             let boot_data_a_after = binding.get("/dev/block/by-name/boot_a").expect("boot_a not found").into_inner();
             let init_boot_data_a_after = binding.get("/dev/block/by-name/init_boot_a").expect("init_boot_a not found").into_inner();
-            drop(binding);
 
             verify_partition_set(&tempdir, &vbmeta_data_a_after, &boot_data_a_after, &init_boot_data_a_after, is_testkey, is_testkey);
             if !is_testkey {
                 assert!(vbmeta_data_a_after == vbmeta_data_a);
                 assert!(boot_data_a_after == boot_data_a);
                 assert!(init_boot_data_a_after == init_boot_data_a);
+                assert!(!binding.get("/dev/block/by-name/vbmeta_a").expect("vbmeta_a not found").is_dirty());
+                assert!(!binding.get("/dev/block/by-name/boot_a").expect("boot_a not found").is_dirty());
+                assert!(!binding.get("/dev/block/by-name/init_boot_a").expect("init_boot_a not found").is_dirty());
             } else {
                 assert!(vbmeta_data_a_after != vbmeta_data_a);
                 assert!(boot_data_a_after != boot_data_a);
                 assert!(init_boot_data_a_after != init_boot_data_a);
+                assert!(binding.get("/dev/block/by-name/vbmeta_a").expect("vbmeta_a not found").is_dirty());
+                assert!(binding.get("/dev/block/by-name/boot_a").expect("boot_a not found").is_dirty());
+                assert!(binding.get("/dev/block/by-name/init_boot_a").expect("init_boot_a not found").is_dirty());
             }
+            drop(binding);
             delete_partition_set(&tempdir);
         };
 
@@ -1762,12 +1895,15 @@ mod tests {
         let vbmeta_data_a_after = binding.get("/dev/block/by-name/vbmeta_a").expect("vbmeta_a not found").into_inner();
         let boot_data_a_after = binding.get("/dev/block/by-name/boot_a").expect("boot_a not found").into_inner();
         let init_boot_data_a_after = binding.get("/dev/block/by-name/init_boot_a").expect("init_boot_a not found").into_inner();
-        drop(binding);
 
         verify_partition_set(&tempdir, &vbmeta_data_a_after, &boot_data_a_after, &init_boot_data_a_after, IS_TESTKEY, false);
-        assert!(vbmeta_data_a_after == vbmeta_data_a);
-        assert!(boot_data_a_after == boot_data_a);
-        assert!(init_boot_data_a_after == init_boot_data_a);
+        assert_eq!(vbmeta_data_a_after, vbmeta_data_a);
+        assert_eq!(boot_data_a_after, boot_data_a);
+        assert_eq!(init_boot_data_a_after, init_boot_data_a);
+        assert!(!binding.get("/dev/block/by-name/vbmeta_a").expect("vbmeta_a not found").is_dirty());
+        assert!(!binding.get("/dev/block/by-name/boot_a").expect("boot_a not found").is_dirty());
+        assert!(!binding.get("/dev/block/by-name/init_boot_a").expect("init_boot_a not found").is_dirty());
+        drop(binding);
 
         // Patch active slot (_a) without --dry-run
         run(

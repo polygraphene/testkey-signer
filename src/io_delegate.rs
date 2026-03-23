@@ -100,51 +100,69 @@ impl IoDelegate for RealDevice {
 
 #[cfg(test)]
 #[derive(Clone)]
+struct MockData {
+    data: std::io::Cursor<Vec<u8>>,
+    is_dirty: bool,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
 pub struct MockDevice {
-    pub data: Arc<Mutex<std::io::Cursor<Vec<u8>>>>,
+    data: Arc<Mutex<MockData>>,
 }
 
 #[cfg(test)]
 impl MockDevice {
     pub fn new(data: Vec<u8>) -> Self {
         Self {
-            data: Arc::new(Mutex::new(std::io::Cursor::new(data))),
+            data: Arc::new(Mutex::new(MockData {
+                data: std::io::Cursor::new(data),
+                is_dirty: false,
+            })),
         }
     }
 
     pub fn into_inner(&self) -> Vec<u8> {
-        self.data.lock().unwrap().get_ref().clone()
+        self.data.lock().unwrap().clone().data.into_inner()
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.data.lock().unwrap().is_dirty
     }
 }
 
 #[cfg(test)]
 impl Read for MockDevice {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.data.lock().unwrap().read(buf)
+        self.data.lock().unwrap().data.read(buf)
     }
 }
 
 #[cfg(test)]
 impl Write for MockDevice {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.data.lock().unwrap().write(buf)
+        let mut data = self.data.lock().unwrap();
+        data.is_dirty = true;
+        data.data.write(buf)
     }
     fn flush(&mut self) -> std::io::Result<()> {
-        self.data.lock().unwrap().flush()
+        let mut data = self.data.lock().unwrap();
+        data.is_dirty = true;
+        data.data.flush()
     }
 }
 
 #[cfg(test)]
 impl Seek for MockDevice {
     fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
-        self.data.lock().unwrap().seek(pos)
+        self.data.lock().unwrap().data.seek(pos)
     }
 }
 
 #[cfg(test)]
 impl IoDelegate for MockDevice {
     fn get_size(&mut self) -> Result<usize> {
-        Ok(self.data.lock().unwrap().get_ref().len())
+        Ok(self.data.lock().unwrap().data.get_ref().len())
     }
 
     fn set_writable(&mut self) -> Result<()> {
