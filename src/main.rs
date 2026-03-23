@@ -114,6 +114,20 @@ struct ParsedHeaders {
     new_descriptors: Vec<AvbDescriptorEnum>,
     parent_vbmeta_hash_descriptor: Option<AvbHashDescriptorInfo>,
     verification_result: PartitionResult,
+
+    // Whether the partition needs patching. To suppress unnecessary patching, the following conditions are checked:
+    // For other (non-vbmeta) partitions:
+    // 1. Hash descriptor does not match. (Digest or image size)
+    // 2. When boot spl is specified, includes property descriptor for boot spl.
+    // 
+    // For the vbmeta partition:
+    // 3. Verity disable is specified.
+    // 4. Child non-chained partition hash descriptor does not match.
+    //    -> Compare bytes of hash descriptor with one calculated from child partition.
+    // 
+    // For all partitions:
+    // 5. Hash or signature don't match in VBMeta structure.
+    needs_patching: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -292,19 +306,24 @@ fn parse_vbmeta(f: &mut dyn IoDelegate, is_vbmeta: bool, replace_hash_descriptor
         None
     };
 
+    let verification_result = PartitionResult {
+        vbmeta_hashes_match,
+        vbmeta_signatures_match,
+        partition_info,
+        incorrect_hash_descriptor_num: if replace_hash_descriptors.is_some() { Some(incorrect_hash_descriptor_num) } else { None },
+        is_testkey,
+        boot_spl,
+    };
+
+    let needs_patching = !verification_result.is_valid() || (replace_hash_descriptors.is_some() && incorrect_hash_descriptor_num != 0);
+
     Ok(ParsedHeaders {
         key_num_bits: key_bits,
         header: vbmeta,
-        verification_result: PartitionResult {
-            vbmeta_hashes_match,
-            vbmeta_signatures_match,
-            partition_info,
-            incorrect_hash_descriptor_num: if replace_hash_descriptors.is_some() { Some(incorrect_hash_descriptor_num) } else { None },
-            is_testkey,
-            boot_spl,
-        },
+        verification_result,
         new_descriptors,
         parent_vbmeta_hash_descriptor,
+        needs_patching,
     })
 }
 
@@ -325,16 +344,22 @@ fn generate_new_header(header: &AvbVBMetaImageHeader, new_descriptors: Vec<AvbDe
     })
 }
 
-fn patch_boot_spl(descriptors_data: &mut Vec<AvbDescriptorEnum>, boot_spl: &str) {
+fn patch_boot_spl(descriptors_data: &mut Vec<AvbDescriptorEnum>, boot_spl: &str) -> bool {
+    let mut patched = false;
     for descriptor in descriptors_data.iter_mut() {
         if let AvbDescriptorEnum::Property(property_descriptor) = descriptor {
             if property_descriptor.key == BOOT_SPL_PROPERTY {
-                info!("Patching boot security patch from {} to {}", String::from_utf8_lossy(&property_descriptor.value), boot_spl);
-                property_descriptor.value = boot_spl.as_bytes().to_vec();
-                property_descriptor.fix_header();
+                let current_val = String::from_utf8_lossy(&property_descriptor.value);
+                if current_val != boot_spl {
+                    info!("Patching boot security patch from {} to {}", current_val, boot_spl);
+                    property_descriptor.value = boot_spl.as_bytes().to_vec();
+                    property_descriptor.fix_header();
+                    patched = true;
+                }
             }
         }
     }
+    patched
 }
 
 /// Read VBMeta from device or files and patch it.
@@ -659,7 +684,9 @@ fn parse_other_partitions<'a>(
             has_non_chained_partition = true;
         }
         if let Some(boot_spl) = &patch_options.boot_spl {
-            patch_boot_spl(&mut parsed.new_descriptors, boot_spl);
+            if patch_boot_spl(&mut parsed.new_descriptors, boot_spl) {
+                parsed.needs_patching = true;
+            }
         }
         parsed_vbmeta_list.push((partition, parsed));
     }
@@ -686,7 +713,9 @@ fn process_vbmeta_partition(
 
             // In case boot partition is non-chained, vbmeta partition also contains the property.
             if let Some(boot_spl) = &patch_options.boot_spl {
-                patch_boot_spl(&mut parsed.new_descriptors, boot_spl);
+                if patch_boot_spl(&mut parsed.new_descriptors, boot_spl) {
+                    parsed.needs_patching = true;
+                }
             }
 
             for (partition, parsed) in parsed_vbmeta_list.iter() {
@@ -724,23 +753,27 @@ fn process_vbmeta_partition(
             }
 
             // Re-generate VBMeta structures and sign them.
-            info!("Generating new VBMeta");
-            let testkey = get_test_key(parsed.key_num_bits)?;
+            if parsed.needs_patching || patch_options.disable_verity {
+                info!("Generating new VBMeta");
+                let testkey = get_test_key(parsed.key_num_bits)?;
 
-            let new_vbmeta = generate_new_header(
-                &parsed.header.header,
-                parsed.new_descriptors,
-                testkey,
-                parsed.verification_result.partition_info.as_ref().map(|p| p.original_image_size),
-                patch_options.disable_verity,
-            )?;
+                let new_vbmeta = generate_new_header(
+                    &parsed.header.header,
+                    parsed.new_descriptors,
+                    testkey,
+                    parsed.verification_result.partition_info.as_ref().map(|p| p.original_image_size),
+                    patch_options.disable_verity,
+                )?;
 
-            env.set_writable(&vbmeta_device, vbmeta.is_device)?;
-            let mut device_write = env.open_device(&vbmeta_device, true, true)?;
+                env.set_writable(&vbmeta_device, vbmeta.is_device)?;
+                let mut device_write = env.open_device(&vbmeta_device, true, true)?;
 
-            device_write.write_all(&new_vbmeta.vbmeta_bytes)?;
+                device_write.write_all(&new_vbmeta.vbmeta_bytes)?;
 
-            warn!("Successfully patched {vbmeta_device}");
+                warn!("Successfully patched {vbmeta_device}");
+            } else {
+                warn!("VBMeta {vbmeta_device} doesn't need patching, skipping write");
+            }
 
             Ok((verification_result, true))
         }
@@ -794,6 +827,10 @@ fn run_patch(env: &dyn Environment, partition_set: HashMap<String, Partition>, r
 
     // Do patching other partitions.
     for (partition, parsed) in parsed_vbmeta_list.into_iter() {
+        if !parsed.needs_patching {
+            warn!("Partition {} doesn't need patching, skipping write", partition.path);
+            continue;
+        }
         info!("Patching {}", partition.path);
         let testkey = get_test_key(parsed.key_num_bits)?;
         let new_vbmeta = generate_new_header(
