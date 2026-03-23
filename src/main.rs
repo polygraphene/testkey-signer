@@ -164,6 +164,7 @@ struct VerificationResult {
 }
 
 fn parse_vbmeta(f: &mut dyn IoDelegate, is_vbmeta: bool, replace_hash_descriptors: Option<&HashMap<String, AvbHashDescriptorInfo>>) -> Result<ParsedHeaders> {
+    // Parse VBMeta structure and footer.
     let vbmeta = VBMeta::from_device(f)?;
 
     if vbmeta.footer.is_some() && is_vbmeta {
@@ -173,6 +174,7 @@ fn parse_vbmeta(f: &mut dyn IoDelegate, is_vbmeta: bool, replace_hash_descriptor
         return Err(anyhow!("Footer not found in partition image."));
     }
 
+    // Hash and signature verification
     let algo_type = vbmeta.header.algorithm_type;
     let (vbmeta_hashes_match, vbmeta_signatures_match, key_bits, is_testkey) = if algo_type == AvbAlgorithmType::AVB_ALGORITHM_TYPE_NONE as u32 {
         // Non chained partition. No verification for hashes or signatures.
@@ -204,6 +206,7 @@ fn parse_vbmeta(f: &mut dyn IoDelegate, is_vbmeta: bool, replace_hash_descriptor
         (Some(vbmeta_hashes_match), Some(vbmeta_signatures_match), Some(key_bits), is_testkey)
     };
 
+    // Read partition content if footer is present (non-vbmeta partitions)
     let original_image = if let Some(footer) = vbmeta.footer {
         f.seek(std::io::SeekFrom::Start(0))?;
         let mut image_data = vec![0; footer.original_image_size as usize];
@@ -213,6 +216,8 @@ fn parse_vbmeta(f: &mut dyn IoDelegate, is_vbmeta: bool, replace_hash_descriptor
         None
     };
 
+    // Non-vbmeta partitions: Verify hash descriptor, and generate new descriptors.
+    // vbmeta partition: Verify child partitions' hash descriptor, and generate new descriptors.
     let mut partition_hashes_match = false;
     let mut parititon_sizes_match = false;
     let mut new_descriptors = vec![];
@@ -287,6 +292,7 @@ fn parse_vbmeta(f: &mut dyn IoDelegate, is_vbmeta: bool, replace_hash_descriptor
         }
     }
 
+    // Get current boot spl if exists.
     let mut boot_spl = None;
     for descriptor in new_descriptors.iter() {
         if let AvbDescriptorEnum::Property(property_descriptor) = descriptor {
