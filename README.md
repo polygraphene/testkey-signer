@@ -9,4 +9,4 @@ MIT
 
 ## Acknowledgments
 
-[LTBox](https://github.com/miner7222/LTBox)
+[LTBox](https://github.com/miner7222/LTBox) by @miner7222
