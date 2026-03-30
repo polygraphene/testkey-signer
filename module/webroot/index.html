@@ -9,13 +9,23 @@
 <body>
     <div class="container">
         <h1>testkey-signer</h1>
+
+        <p>OTA steps:</p>
+        <ol>
+            <li>Restore active slot</li>
+            <li>Apply OTA</li>
+            <li>Backup inactive slot</li>
+            <li>Install kernelsu to inactive slot</li>
+            <li>Patch inactive slot</li>
+            <li>Reboot</li>
+        </ol>
         <div class="button-grid">
             <button id="verify-current-slot">Verify Current Slot</button>
             <button id="verify-inactive-slot">Verify Inactive Slot</button>
         </div>
 
-        <details class="patch-options">
-            <summary>Advanced Patch Options</summary>
+        <details class="patch">
+            <summary>Sign/Patch</summary>
             
             <div class="options-container">
                 <label class="checkbox-label">
@@ -32,6 +42,17 @@
             <div class="button-grid">
                 <button id="patch-current-slot">Patch Current Slot</button>
                 <button id="patch-inactive-slot">Patch Inactive Slot</button>
+            </div>
+        </details>
+
+        <details class="backup-restore">
+            <summary>Backup/Restore</summary>
+            
+            <div class="button-grid">
+                <button id="backup-btn">Backup</button>
+                <p>Backup inactive slot to /data/adb/modules/testkey-signer/backup. Use it immediately after ota.</p>
+                <button id="restore-btn">Restore</button>
+                <p>Restore active slot from /data/adb/modules/testkey-signer/backup. Use it immediately before ota.</p>
             </div>
         </details>
         <div id="signing-status">Checking signing status...</div>

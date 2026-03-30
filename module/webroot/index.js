@@ -78,8 +78,6 @@ async function run(args) {
         let result = "";
         signer.stdout.on('data', (data) => {
             result += data;
-            data = data.replaceAll("\n", "<br>");
-            document.getElementById("result").innerHTML += data + "<br>";
             console.log(`stdout: ${data}`);
         });
 
@@ -90,6 +88,14 @@ async function run(args) {
         });
 
         signer.on('exit', (code) => {
+            try {
+                let jsonResult = JSON.parse(result);
+                result = JSON.stringify(jsonResult, null, 2);
+            } catch (e) {
+                console.error(e);
+            }
+            result = result.replaceAll("\n", "<br>").replaceAll(" ", "&nbsp;");
+            document.getElementById("result").innerHTML += result + "<br>";
             document.getElementById("log").innerHTML += `child process exited with code ${code}` + "<br>";
             console.log(`child process exited with code ${code}`);
             resolve(result);
@@ -150,4 +156,45 @@ document.getElementById("patch-inactive-slot").addEventListener("click", async (
     await run(args);
     inactive_slot_json = JSON.parse(await run(['verify-device', '--json', '--inactive-slot']));
     update();
+});
+
+async function runScript(scriptName) {
+    const p = spawn(`${BASE}/${scriptName}`);
+
+    let promise = new Promise((resolve, reject) => {
+        let result = "";
+        p.stdout.on('data', (data) => {
+            result += data;
+            data = data.replaceAll("\n", "<br>");
+            document.getElementById("result").innerHTML += data + "<br>";
+            console.log(`stdout: ${data}`);
+        });
+
+        p.stderr.on('data', (data) => {
+            data = data.replaceAll("\n", "<br>");
+            document.getElementById("log").innerHTML += data + "<br>";
+            console.log(`stderr: ${data}`);
+        });
+
+        p.on('exit', (code) => {
+            document.getElementById("log").innerHTML += `child process exited with code ${code}` + "<br>";
+            console.log(`child process exited with code ${code}`);
+            resolve(result);
+        });
+    });
+    return await promise;
+}
+
+document.getElementById("backup-btn").addEventListener("click", async () => {
+    if (!(await showDialog("Are you sure you want to run backup?"))) return;
+    document.getElementById("result").innerHTML = "";
+    document.getElementById("log").innerHTML = "";
+    await runScript('backup.sh');
+});
+
+document.getElementById("restore-btn").addEventListener("click", async () => {
+    if (!(await showDialog("Are you sure you want to run restore?"))) return;
+    document.getElementById("result").innerHTML = "";
+    document.getElementById("log").innerHTML = "";
+    await runScript('restore.sh');
 });
