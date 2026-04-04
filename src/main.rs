@@ -801,7 +801,7 @@ fn process_vbmeta_partition(
                 partition_results,
             };
 
-            if !should_proceed_with_patch(run_mode, all_ok, None)? {
+            if !should_proceed_with_patch(run_mode, all_ok)? {
                 return Ok((verification_result, false));
             }
 
@@ -1710,7 +1710,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dont_patch_non_testkey() {
+    fn test_re_sign_non_testkey() {
         use crate::io_delegate::MockDevice;
 
         let _ = env_logger::builder().is_test(true).try_init();
@@ -1764,33 +1764,20 @@ mod tests {
                 },
                 &mock_env,
             );
-            if !is_testkey {
-                assert!(matches!(result, Err(_)));
-            } else {
-                assert!(result.is_ok());
-            }
+            assert!(result.is_ok());
 
             let binding = mock_env.devices.lock().unwrap();
             let vbmeta_data_a_after = binding.get("/dev/block/by-name/vbmeta_a").expect("vbmeta_a not found").into_inner();
             let boot_data_a_after = binding.get("/dev/block/by-name/boot_a").expect("boot_a not found").into_inner();
             let init_boot_data_a_after = binding.get("/dev/block/by-name/init_boot_a").expect("init_boot_a not found").into_inner();
 
-            verify_partition_set(&tempdir, &vbmeta_data_a_after, &boot_data_a_after, &init_boot_data_a_after, is_testkey, is_testkey);
-            if !is_testkey {
-                assert!(vbmeta_data_a_after == vbmeta_data_a);
-                assert!(boot_data_a_after == boot_data_a);
-                assert!(init_boot_data_a_after == init_boot_data_a);
-                assert!(!binding.get("/dev/block/by-name/vbmeta_a").expect("vbmeta_a not found").is_dirty());
-                assert!(!binding.get("/dev/block/by-name/boot_a").expect("boot_a not found").is_dirty());
-                assert!(!binding.get("/dev/block/by-name/init_boot_a").expect("init_boot_a not found").is_dirty());
-            } else {
-                assert!(vbmeta_data_a_after != vbmeta_data_a);
-                assert!(boot_data_a_after != boot_data_a);
-                assert!(init_boot_data_a_after != init_boot_data_a);
-                assert!(binding.get("/dev/block/by-name/vbmeta_a").expect("vbmeta_a not found").is_dirty());
-                assert!(binding.get("/dev/block/by-name/boot_a").expect("boot_a not found").is_dirty());
-                assert!(binding.get("/dev/block/by-name/init_boot_a").expect("init_boot_a not found").is_dirty());
-            }
+            verify_partition_set(&tempdir, &vbmeta_data_a_after, &boot_data_a_after, &init_boot_data_a_after, true, true);
+            assert!(vbmeta_data_a_after != vbmeta_data_a);
+            assert!(boot_data_a_after != boot_data_a);
+            assert!(init_boot_data_a_after != init_boot_data_a);
+            assert!(binding.get("/dev/block/by-name/vbmeta_a").expect("vbmeta_a not found").is_dirty());
+            assert!(binding.get("/dev/block/by-name/boot_a").expect("boot_a not found").is_dirty());
+            assert!(binding.get("/dev/block/by-name/init_boot_a").expect("init_boot_a not found").is_dirty());
             drop(binding);
             delete_partition_set(&tempdir);
         };
