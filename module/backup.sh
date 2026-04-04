@@ -1,7 +1,7 @@
 #!/bin/sh
 
 set -ex
-d="/data/adb/modules/testkey-signer/backup"
+d="/data/adb/testkey-signer/backup"
 inactive=""
 if [ "$(getprop ro.boot.slot_suffix)" = "_a" ]; then
     inactive="_b"
