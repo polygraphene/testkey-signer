@@ -639,13 +639,9 @@ struct PatchOptions {
     disable_verity: bool,
 }
 
-fn should_proceed_with_patch(run_mode: RunMode, all_ok: bool, is_testkey: Option<bool>) -> Result<bool> {
+fn should_proceed_with_patch(run_mode: RunMode, all_ok: bool) -> Result<bool> {
     if matches!(run_mode, RunMode::VerifyOnly) {
         return Ok(false);
-    }
-    if matches!(is_testkey, Some(false)) {
-        info!("Device is not signed by testkey. Unsupported.");
-        return Err(anyhow!("Unsupported key."));
     }
     if all_ok {
         info!("Hash and signature are all okay. So no need to re-sign. Exit.");
@@ -754,7 +750,7 @@ fn process_vbmeta_partition(
                 partition_results,
             };
 
-            if !should_proceed_with_patch(run_mode, all_ok, Some(parsed.verification_result.is_testkey))? {
+            if !should_proceed_with_patch(run_mode, all_ok)? {
                 return Ok((verification_result, false));
             }
 
