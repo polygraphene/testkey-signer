@@ -94,8 +94,8 @@ async function run(args) {
             } catch (e) {
                 console.error(e);
             }
-            result = result.replaceAll("\n", "<br>").replaceAll(" ", "&nbsp;");
-            document.getElementById("result").innerHTML += result + "<br>";
+            let htmlResult = result.replaceAll("\n", "<br>").replaceAll(" ", "&nbsp;");
+            document.getElementById("result").innerHTML += htmlResult + "<br>";
             document.getElementById("log").innerHTML += `child process exited with code ${code}` + "<br>";
             console.log(`child process exited with code ${code}`);
             resolve(result);
