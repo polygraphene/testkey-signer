@@ -71,7 +71,7 @@ function update() {
     }
 }
 
-async function run(args) {
+async function run(args, show_log) {
     const signer = spawn(`${BASE}/testkey-signer`, args);
 
     let promise = new Promise((resolve, reject) => {
@@ -83,7 +83,9 @@ async function run(args) {
 
         signer.stderr.on('data', (data) => {
             data = data.replaceAll("\n", "<br>");
-            document.getElementById("log").innerHTML += data + "<br>";
+            if (show_log) {
+                document.getElementById("log").innerHTML += data + "<br>";
+            }
             console.log(`stderr: ${data}`);
         });
 
@@ -95,8 +97,10 @@ async function run(args) {
                 console.error(e);
             }
             let htmlResult = result.replaceAll("\n", "<br>").replaceAll(" ", "&nbsp;");
-            document.getElementById("result").innerHTML += htmlResult + "<br>";
-            document.getElementById("log").innerHTML += `child process exited with code ${code}` + "<br>";
+            if (show_log) {
+                document.getElementById("result").innerHTML += htmlResult + "<br>";
+                document.getElementById("log").innerHTML += `child process exited with code ${code}` + "<br>";
+            }
             console.log(`child process exited with code ${code}`);
             resolve(result);
         });
@@ -108,7 +112,7 @@ document.getElementById("verify-current-slot").addEventListener("click", async (
     document.getElementById("result").innerHTML = "";
     document.getElementById("log").innerHTML = "";
 
-    active_slot_json = JSON.parse(await run(['verify-device', '--json']));
+    active_slot_json = JSON.parse(await run(['verify-device', '--json'], true));
     update();
 });
 
@@ -116,7 +120,7 @@ document.getElementById("verify-inactive-slot").addEventListener("click", async 
     document.getElementById("result").innerHTML = "";
     document.getElementById("log").innerHTML = "";
 
-    inactive_slot_json = JSON.parse(await run(['verify-device', '--json', '--inactive-slot']));
+    inactive_slot_json = JSON.parse(await run(['verify-device', '--json', '--inactive-slot'], true));
     update();
 });
 
@@ -134,8 +138,8 @@ document.getElementById("patch-current-slot").addEventListener("click", async ()
         args.push('--boot-spl', bootSpl);
     }
 
-    await run(args);
-    active_slot_json = JSON.parse(await run(['verify-device', '--json']));
+    await run(args, true);
+    active_slot_json = JSON.parse(await run(['verify-device', '--json'], false));
     update();
 });
 
@@ -153,8 +157,8 @@ document.getElementById("patch-inactive-slot").addEventListener("click", async (
         args.push('--boot-spl', bootSpl);
     }
 
-    await run(args);
-    inactive_slot_json = JSON.parse(await run(['verify-device', '--json', '--inactive-slot']));
+    await run(args, true);
+    inactive_slot_json = JSON.parse(await run(['verify-device', '--json', '--inactive-slot'], false));
     update();
 });
 
