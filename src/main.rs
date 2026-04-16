@@ -690,6 +690,7 @@ fn parse_other_partitions<'a>(
             continue;
         }
         let mut device = env.open_device(&partition.path, partition.is_device, false)?;
+        info!("");
         info!("Parsing VBMeta for {}", partition.path);
         let mut parsed = parse_vbmeta(device.as_mut(), false, None, None).context(format!("Failed to parse VBMeta for {}", partition.path))?;
         if let Some(parent_vbmeta_hash_descriptor) = &mut parsed.parent_vbmeta_hash_descriptor {
@@ -701,7 +702,9 @@ fn parse_other_partitions<'a>(
                 parsed.needs_patching = true;
             }
         }
+        info!("Needs patching: {}", parsed.needs_patching);
         if parsed.needs_patching && parsed.key_num_bits.is_some() {
+            info!("Saving key num bits for chained descriptor");
             replace_chain_descriptors.insert(partition.name.clone(), parsed.key_num_bits.unwrap());
         }
         parsed_vbmeta_list.push((partition, parsed));
@@ -725,6 +728,7 @@ fn process_vbmeta_partition(
             let vbmeta_device = vbmeta.path.clone();
             let mut device = env.open_device(&vbmeta_device, vbmeta.is_device, false)?;
 
+            info!("");
             info!("Parsing VBMeta for {vbmeta_device}.");
             let mut parsed = parse_vbmeta(device.as_mut(), true, Some(replace_hash_descriptors), Some(replace_chain_descriptors)).context(format!("Failed to parse VBMeta for {vbmeta_device}"))?;
 
