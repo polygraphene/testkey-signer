@@ -301,6 +301,33 @@ fn bindgen_test_layout_AvbChainPartitionDescriptor() {
         )
     );
 }
+impl AvbChainPartitionDescriptor {
+    pub fn from_bytes(src: &[u8]) -> Result<Self> {
+        if src.len() < size_of::<AvbChainPartitionDescriptor>() {
+            return Err(anyhow!("Invalid descriptor"));
+        }
+        let mut descriptor = Self::new_zeroed();
+        Self::to_host_byte_order(unsafe { &*(src.as_ptr() as *const Self) }, &mut descriptor);
+
+        Ok(descriptor)
+    }
+
+    fn to_host_byte_order(&self, dest: &mut Self) {
+        dest.parent_descriptor.tag = self.parent_descriptor.tag.to_be();
+        dest.parent_descriptor.num_bytes_following = self.parent_descriptor.num_bytes_following.to_be();
+        dest.rollback_index_location = self.rollback_index_location.to_be();
+        dest.partition_name_len = self.partition_name_len.to_be();
+        dest.public_key_len = self.public_key_len.to_be();
+        dest.flags = self.flags.to_be();
+        dest.reserved = self.reserved;
+    }
+
+    fn to_be_bytes(&self) -> [u8; size_of::<Self>()] {
+        let mut bytes = [0u8; size_of::<Self>()];
+        self.to_host_byte_order(unsafe { &mut *(bytes.as_mut_ptr() as *mut Self) });
+        bytes
+    }
+}
 impl Default for AvbChainPartitionDescriptor {
     fn default() -> Self {
         let mut s = ::core::mem::MaybeUninit::<Self>::uninit();
@@ -308,6 +335,53 @@ impl Default for AvbChainPartitionDescriptor {
             ::core::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
             s.assume_init()
         }
+    }
+}
+#[derive(Clone)]
+pub struct AvbChainPartitionDescriptorInfo {
+    pub descriptor: AvbChainPartitionDescriptor,
+    pub partition_name: Vec<u8>,
+    pub public_key: Vec<u8>,
+}
+impl AvbChainPartitionDescriptorInfo {
+    pub fn from_bytes(src: &[u8]) -> Result<Self> {
+        let descriptor = AvbChainPartitionDescriptor::from_bytes(src)?;
+
+        let mut offset = size_of::<AvbChainPartitionDescriptor>();
+        let partition_name = src[offset..offset + descriptor.partition_name_len as usize].to_vec();
+        offset += descriptor.partition_name_len as usize;
+        let public_key = src[offset..offset + descriptor.public_key_len as usize].to_vec();
+
+        Ok(Self {
+            descriptor,
+            partition_name,
+            public_key,
+        })
+    }
+
+    pub fn fix_header(&mut self) {
+        self.descriptor.partition_name_len = self.partition_name.len() as u32;
+        self.descriptor.public_key_len = self.public_key.len() as u32;
+        self.descriptor.parent_descriptor.num_bytes_following = (size_of::<AvbChainPartitionDescriptor>() - AVB_DESCRIPTOR_SIZE + self.partition_name.len() + self.public_key.len()) as u64;
+        self.descriptor.parent_descriptor.num_bytes_following += padding_size(self.descriptor.parent_descriptor.num_bytes_following as usize, DESCRIPTOR_ALIGN) as u64;
+    }
+
+    pub fn to_be_bytes(&self) -> Vec<u8> {
+        let mut bytes = self.descriptor.to_be_bytes().to_vec();
+        bytes.extend_from_slice(&self.partition_name);
+        bytes.extend_from_slice(&self.public_key);
+        pad_right(&mut bytes, DESCRIPTOR_ALIGN);
+        bytes
+    }
+
+    pub fn get_public_key(&self) -> Result<RsaPublicKey> {
+        read_avb_public_key(&self.public_key)
+    }
+
+    pub fn set_public_key(&mut self, public_key: &RsaPublicKey) -> Result<()> {
+        self.public_key = convert_to_avb_pubkey(public_key)?;
+        self.fix_header();
+        Ok(())
     }
 }
 #[repr(u32)]
@@ -2730,6 +2804,7 @@ impl AvbRawDescriptor {
 pub enum AvbDescriptorEnum {
     Hash(AvbHashDescriptorInfo),
     Property(AvbPropertyDescriptorInfo),
+    Chain(AvbChainPartitionDescriptorInfo),
     Raw(AvbRawDescriptor),
 }
 
@@ -2738,6 +2813,7 @@ impl AvbDescriptorEnum {
         match self {
             AvbDescriptorEnum::Hash(hash_descriptor) => hash_descriptor.to_be_bytes(),
             AvbDescriptorEnum::Property(property_descriptor) => property_descriptor.to_be_bytes(),
+            AvbDescriptorEnum::Chain(chain_descriptor) => chain_descriptor.to_be_bytes(),
             AvbDescriptorEnum::Raw(raw_descriptor) => raw_descriptor.data.clone(),
         }
     }
@@ -2795,6 +2871,13 @@ fn convert_to_avb_pubkey(pubkey: &RsaPublicKey) -> Result<Vec<u8>> {
     Ok(pubkey.to_be_bytes())
 }
 
+fn read_avb_public_key(public_key_bytes: &[u8]) -> Result<RsaPublicKey> {
+    let public_key = AvbRSAPublicKey::from_bytes(public_key_bytes)?;
+
+    let n = BigUint::from_bytes_be(&public_key.modulus);
+    let e = BigUint::from(PUBLIC_EXPONENT);
+    Ok(RsaPublicKey::new(n, e)?)
+}
 
 #[derive(Clone)]
 pub struct VBMeta {
@@ -2944,6 +3027,9 @@ impl VBMeta {
             } else if tag == AvbDescriptorTag::AVB_DESCRIPTOR_TAG_PROPERTY as u64 {
                 let property_descriptor_info = AvbPropertyDescriptorInfo::from_bytes(descriptor_data)?;
                 descriptors.push(AvbDescriptorEnum::Property(property_descriptor_info));
+            } else if tag == AvbDescriptorTag::AVB_DESCRIPTOR_TAG_CHAIN_PARTITION as u64 {
+                let chain_descriptor_info = AvbChainPartitionDescriptorInfo::from_bytes(descriptor_data)?;
+                descriptors.push(AvbDescriptorEnum::Chain(chain_descriptor_info));
             } else {
                 let avb_raw_descriptor = AvbRawDescriptor::from_bytes(descriptor_data);
                 descriptors.push(AvbDescriptorEnum::Raw(avb_raw_descriptor));
@@ -2992,13 +3078,9 @@ impl VBMeta {
     }
 
     pub fn get_public_key(&self) -> Result<RsaPublicKey> {
-        let public_key = self.header.get_public_key(&self.auxiliary_data)?;
+        let public_key_bytes = self.header.get_public_key(&self.auxiliary_data)?;
 
-        let public_key = AvbRSAPublicKey::from_bytes(public_key)?;
-
-        let n = BigUint::from_bytes_be(&public_key.modulus);
-        let e = BigUint::from(PUBLIC_EXPONENT);
-        Ok(RsaPublicKey::new(n, e)?)
+        read_avb_public_key(public_key_bytes)
     }
 
     pub fn verify_vbmeta_signature(&self) -> Result<bool> {

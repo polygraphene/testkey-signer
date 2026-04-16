@@ -163,7 +163,7 @@ struct VerificationResult {
     partition_results: HashMap<String, PartitionResult>,
 }
 
-fn parse_vbmeta(f: &mut dyn IoDelegate, is_vbmeta: bool, replace_hash_descriptors: Option<&HashMap<String, AvbHashDescriptorInfo>>) -> Result<ParsedHeaders> {
+fn parse_vbmeta(f: &mut dyn IoDelegate, is_vbmeta: bool, replace_hash_descriptors: Option<&HashMap<String, AvbHashDescriptorInfo>>, replace_chain_descriptors: Option<&HashMap<String, KeyBits>>) -> Result<ParsedHeaders> {
     // Parse VBMeta structure and footer.
     let vbmeta = VBMeta::from_device(f)?;
 
@@ -200,9 +200,8 @@ fn parse_vbmeta(f: &mut dyn IoDelegate, is_vbmeta: bool, replace_hash_descriptor
         } else {
             return Err(anyhow!("Unknown rsa key size: {num_bits}"));
         };
-        let is_testkey = if let Ok(Some(testkey)) = get_test_key(Some(key_bits)) {
-            testkey.to_public_key() == public_key
-        } else { false };
+        let testkey = get_test_key(key_bits)?;
+        let is_testkey = testkey.to_public_key() == public_key;
         (Some(vbmeta_hashes_match), Some(vbmeta_signatures_match), Some(key_bits), is_testkey)
     };
 
@@ -285,6 +284,22 @@ fn parse_vbmeta(f: &mut dyn IoDelegate, is_vbmeta: bool, replace_hash_descriptor
                         }
                     }
                 };
+            }
+            AvbDescriptorEnum::Chain(chain_descriptor) => {
+                assert!(original_image.is_none());
+                let partition_name = String::from_utf8_lossy(&chain_descriptor.partition_name).to_string();
+
+                let mut new_chain_descriptor = chain_descriptor.clone();
+                if let Some(replace_chain_descriptors) = replace_chain_descriptors {
+                    if let Some(key_bits) = replace_chain_descriptors.get(&partition_name) {
+                        let test_key = get_test_key(*key_bits)?;
+                        if chain_descriptor.get_public_key()? != test_key.to_public_key() {
+                            info!("Replacing public key in chain descriptor for {partition_name} in vbmeta partition.");
+                            new_chain_descriptor.set_public_key(&test_key.to_public_key())?;
+                        }
+                    }
+                }
+                new_descriptors.push(AvbDescriptorEnum::Chain(new_chain_descriptor));
             }
             _ => {
                 new_descriptors.push(descriptor.clone());
@@ -558,17 +573,12 @@ fn run_patch_files(env: &dyn Environment, input_filenames: Vec<String>, run_mode
     run_patch(env, partition_set, run_mode, patch_options)
 }
 
-fn get_test_key(key_num_bits: Option<KeyBits>) -> Result<Option<RsaPrivateKey>> {
-    match key_num_bits {
-        Some(key_bits) => {
-            let testkey = match key_bits {
-                KeyBits::Key2048 => TESTKEY_2048,
-                KeyBits::Key4096 => TESTKEY_4096,
-            };
-            Ok(Some(RsaPrivateKey::from_pkcs1_pem(String::from_utf8(testkey.to_vec())?.as_str())?))
-        }
-        None => Ok(None),
-    }
+fn get_test_key(key_num_bits: KeyBits) -> Result<RsaPrivateKey> {
+    let testkey = match key_num_bits {
+        KeyBits::Key2048 => TESTKEY_2048,
+        KeyBits::Key4096 => TESTKEY_4096,
+    };
+    Ok(RsaPrivateKey::from_pkcs1_pem(String::from_utf8(testkey.to_vec())?.as_str())?)
 }
 
 fn run_patch_device(env: &dyn Environment, inactive_slot: bool, run_mode: RunMode, patch_options: PatchOptions) -> Result<VerificationResult> {
@@ -669,9 +679,10 @@ fn parse_other_partitions<'a>(
     env: &dyn Environment,
     partition_set: &'a HashMap<String, Partition>,
     patch_options: &PatchOptions,
-) -> Result<(Vec<(&'a Partition, ParsedHeaders)>, HashMap<String, AvbHashDescriptorInfo>, bool)> {
+) -> Result<(Vec<(&'a Partition, ParsedHeaders)>, HashMap<String, AvbHashDescriptorInfo>, HashMap<String, KeyBits>, bool)> {
     let mut parsed_vbmeta_list = vec![];
     let mut replace_hash_descriptors = HashMap::new();
+    let mut replace_chain_descriptors = HashMap::new();
     let mut has_non_chained_partition = false;
 
     for partition in partition_set.values() {
@@ -680,7 +691,7 @@ fn parse_other_partitions<'a>(
         }
         let mut device = env.open_device(&partition.path, partition.is_device, false)?;
         info!("Parsing VBMeta for {}", partition.path);
-        let mut parsed = parse_vbmeta(device.as_mut(), false, None).context(format!("Failed to parse VBMeta for {}", partition.path))?;
+        let mut parsed = parse_vbmeta(device.as_mut(), false, None, None).context(format!("Failed to parse VBMeta for {}", partition.path))?;
         if let Some(parent_vbmeta_hash_descriptor) = &mut parsed.parent_vbmeta_hash_descriptor {
             replace_hash_descriptors.insert(partition.name.clone(), parent_vbmeta_hash_descriptor.clone());
             has_non_chained_partition = true;
@@ -690,10 +701,13 @@ fn parse_other_partitions<'a>(
                 parsed.needs_patching = true;
             }
         }
+        if parsed.needs_patching && parsed.key_num_bits.is_some() {
+            replace_chain_descriptors.insert(partition.name.clone(), parsed.key_num_bits.unwrap());
+        }
         parsed_vbmeta_list.push((partition, parsed));
     }
 
-    Ok((parsed_vbmeta_list, replace_hash_descriptors, has_non_chained_partition))
+    Ok((parsed_vbmeta_list, replace_hash_descriptors, replace_chain_descriptors, has_non_chained_partition))
 }
 
 fn process_vbmeta_partition(
@@ -701,6 +715,7 @@ fn process_vbmeta_partition(
     vbmeta_opt: Option<&Partition>,
     parsed_vbmeta_list: &[(&Partition, ParsedHeaders)],
     replace_hash_descriptors: &HashMap<String, AvbHashDescriptorInfo>,
+    replace_chain_descriptors: &HashMap<String, KeyBits>,
     has_non_chained_partition: bool,
     patch_options: &PatchOptions,
     run_mode: RunMode,
@@ -711,7 +726,7 @@ fn process_vbmeta_partition(
             let mut device = env.open_device(&vbmeta_device, vbmeta.is_device, false)?;
 
             info!("Parsing VBMeta for {vbmeta_device}.");
-            let mut parsed = parse_vbmeta(device.as_mut(), true, Some(replace_hash_descriptors)).context(format!("Failed to parse VBMeta for {vbmeta_device}"))?;
+            let mut parsed = parse_vbmeta(device.as_mut(), true, Some(replace_hash_descriptors), Some(replace_chain_descriptors)).context(format!("Failed to parse VBMeta for {vbmeta_device}"))?;
 
             // In case boot partition is non-chained, vbmeta partition also contains the property.
             if let Some(boot_spl) = &patch_options.boot_spl {
@@ -757,7 +772,7 @@ fn process_vbmeta_partition(
             // Re-generate VBMeta structures and sign them.
             if parsed.needs_patching || patch_options.disable_verity {
                 info!("Generating new VBMeta");
-                let testkey = get_test_key(parsed.key_num_bits)?;
+                let testkey = parsed.key_num_bits.map(get_test_key).transpose()?;
 
                 let new_vbmeta = generate_new_header(
                     &parsed.header.header,
@@ -811,13 +826,14 @@ fn process_vbmeta_partition(
 }
 
 fn run_patch(env: &dyn Environment, partition_set: HashMap<String, Partition>, run_mode: RunMode, patch_options: PatchOptions) -> Result<VerificationResult> {
-    let (parsed_vbmeta_list, replace_hash_descriptors, has_non_chained_partition) = parse_other_partitions(env, &partition_set, &patch_options)?;
+    let (parsed_vbmeta_list, replace_hash_descriptors, replace_chain_descriptors, has_non_chained_partition) = parse_other_partitions(env, &partition_set, &patch_options)?;
 
     let (verification_result, proceed) = process_vbmeta_partition(
         env,
         partition_set.get("vbmeta"),
         &parsed_vbmeta_list,
         &replace_hash_descriptors,
+        &replace_chain_descriptors,
         has_non_chained_partition,
         &patch_options,
         run_mode,
@@ -834,7 +850,7 @@ fn run_patch(env: &dyn Environment, partition_set: HashMap<String, Partition>, r
             continue;
         }
         info!("Patching {}", partition.path);
-        let testkey = get_test_key(parsed.key_num_bits)?;
+        let testkey = match parsed.key_num_bits { Some(key_bits) => Some(get_test_key(key_bits)?), None => None };
         let new_vbmeta = generate_new_header(
             &parsed.header.header,
             parsed.new_descriptors,
