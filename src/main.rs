@@ -893,7 +893,7 @@ mod tests {
         }
     }
 
-    fn prepare_boot_image(tempdir: &Tempdir) -> std::path::PathBuf {
+    fn prepare_boot_image(tempdir: &Tempdir, is_testkey: bool) -> std::path::PathBuf {
         let outfile = tempdir.dir.join("bootmod.img");
         let mut f = std::fs::File::create_new(&outfile).expect("Failed to create bootmod.img");
         let mut data = b"boot testdata".to_vec();
@@ -915,7 +915,7 @@ mod tests {
             .arg("--salt")
             .arg(SALT)
             .arg("--key")
-            .arg("testkey_rsa4096.pem")
+            .arg(if is_testkey { "testkey_rsa4096.pem" } else { "tests/non-testkey.pem" })
             .arg("--rollback_index")
             .arg("123")
             .arg("--prop")
@@ -975,8 +975,8 @@ mod tests {
         outfile
     }
 
-    fn prepare_partition_set(tempdir: &Tempdir, testkey: bool) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
-        let boot_image = prepare_boot_image(tempdir);
+    fn prepare_partition_set(tempdir: &Tempdir, is_testkey: bool) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        let boot_image = prepare_boot_image(tempdir, is_testkey);
         let init_boot_image = prepare_init_boot_image(tempdir);
         let outfile = tempdir.dir.join("vbmetaout.img");
 
@@ -990,7 +990,7 @@ mod tests {
             .arg("--algorithm")
             .arg("SHA256_RSA4096")
             .arg("--key")
-            .arg(if testkey { "testkey_rsa4096.pem" } else { "tests/non-testkey.pem" })
+            .arg(if is_testkey { "testkey_rsa4096.pem" } else { "tests/non-testkey.pem" })
             .arg("--rollback_index")
             .arg("456")
             .arg("--prop")
@@ -998,7 +998,7 @@ mod tests {
             .arg("--include_descriptors_from_image")
             .arg(init_boot_image.to_str().unwrap())
             .arg("--chain_partition")
-            .arg("boot:1:testkey_rsa4096.avbpubkey")
+            .arg(if is_testkey { "boot:1:testkey_rsa4096.avbpubkey" } else { "boot:1:tests/non-testkey.avbpubkey" })
             .output()
             .expect("Failed to run avbtool");
 
@@ -1119,7 +1119,7 @@ mod tests {
             .arg("--key")
             .arg(if is_testkey { "testkey_rsa4096.pem" } else { "tests/non-testkey.pem" })
             .arg("--expected_chain_partition")
-            .arg("boot:1:testkey_rsa4096.avbpubkey")
+            .arg(if is_testkey { "boot:1:testkey_rsa4096.avbpubkey" } else { "boot:1:tests/non-testkey.avbpubkey" })
             .arg("--use_partition_name")
             .output()
             .expect("Failed to run avbtool");
@@ -1202,7 +1202,7 @@ mod tests {
 
         let tempdir = Tempdir::new();
 
-        let bootimg = prepare_boot_image(&tempdir);
+        let bootimg = prepare_boot_image(&tempdir, true);
 
         let mut f = std::fs::OpenOptions::new().read(true).write(true).open(&bootimg).expect("Failed to open bootmod.img");
         f.seek(std::io::SeekFrom::Start(2)).expect("Failed to seek");
