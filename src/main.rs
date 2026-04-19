@@ -1479,6 +1479,88 @@ mod tests {
     }
 
     #[test]
+    fn test_patch_device_explicit_partitions_no_write_to_unspecified() {
+        use std::collections::HashMap;
+        use crate::io_delegate::MockDevice;
+
+        let _ = env_logger::builder().is_test(true).try_init();
+
+        const IS_TESTKEY: bool = true;
+        let tempdir = Tempdir::new();
+        let (vbmetaimg, bootimg, init_bootimg) = prepare_partition_set(&tempdir, IS_TESTKEY);
+        let vbmeta_data = std::fs::read(&vbmetaimg).expect("Failed to read vbmeta.img");
+        let boot_data = std::fs::read(&bootimg).expect("Failed to read boot.img");
+        let init_boot_data = std::fs::read(&init_bootimg).expect("Failed to read init_boot.img");
+
+        let vbmeta_data_a = vbmeta_data.clone();
+        let mut boot_data_a = boot_data.clone();
+        let mut init_boot_data_a = init_boot_data.clone();
+
+        // Modify boot
+        boot_data_a[2] = b'a';
+
+        // Modify init_boot
+        let init_boot_mod_data = b"It is modified init_boot.img content";
+        init_boot_data_a[0..init_boot_mod_data.len()].copy_from_slice(init_boot_mod_data);
+
+        let mut props = HashMap::new();
+        props.insert("ro.boot.slot_suffix".to_string(), "_a".to_string());
+
+        let mut devices = HashMap::new();
+        devices.insert("/dev/block/by-name/vbmeta_a".to_string(), MockDevice::new(vbmeta_data_a.clone()));
+        devices.insert("/dev/block/by-name/boot_a".to_string(), MockDevice::new(boot_data_a.clone()));
+        devices.insert("/dev/block/by-name/init_boot_a".to_string(), MockDevice::new(init_boot_data_a.clone()));
+
+        let mock_env = MockEnvironment {
+            props,
+            devices: std::sync::Mutex::new(devices),
+        };
+
+        run(
+            Args {
+                command: Commands::PatchDevice { 
+                    yes: true, 
+                    inactive_slot: false, 
+                    dry_run: false, 
+                    boot_spl: Some("Modified boot spl".to_string()), 
+                    disable_verity: false, 
+                    partitions: Some(vec!["vbmeta".to_string(), "boot".to_string()])
+                },
+                log_level: Some("info".to_string()),
+                json: false,
+            },
+            &mock_env,
+        )
+        .expect("Failed to patch active slot");
+
+        let binding = mock_env.devices.lock().unwrap();
+        let patched_vbmeta_data_a = binding.get("/dev/block/by-name/vbmeta_a").expect("vbmeta_a not found").into_inner();
+        let patched_boot_data_a = binding.get("/dev/block/by-name/boot_a").expect("boot_a not found").into_inner();
+        let patched_init_boot_data_a = binding.get("/dev/block/by-name/init_boot_a").expect("init_boot_a not found").into_inner();
+
+        // boot_a should be patched
+        assert!(patched_boot_data_a != boot_data);
+        assert!(binding.get("/dev/block/by-name/boot_a").expect("boot_a not found").is_dirty());
+
+        // vbmeta should NOT be patched because boot is chained and already uses testkey,
+        // and init_boot wasn't checked/patched so its hash descriptor remains the same.
+        assert_eq!(patched_vbmeta_data_a, vbmeta_data);
+        assert!(!binding.get("/dev/block/by-name/vbmeta_a").expect("vbmeta_a not found").is_dirty());
+
+        // init_boot_a should NOT be modified by the patch device!
+        assert_eq!(patched_init_boot_data_a, init_boot_data_a);
+        assert!(!binding.get("/dev/block/by-name/init_boot_a").expect("init_boot_a not found").is_dirty());
+
+        drop(binding);
+
+        // We can verify `boot_a` and `vbmeta_a` by providing the original `init_boot_data` 
+        // to `verify_partition_set` (since vbmeta's hash descriptor still expects the old one)
+        verify_partition_set(&tempdir, &patched_vbmeta_data_a, &patched_boot_data_a, &init_boot_data, IS_TESTKEY, true);
+
+        delete_partition_set(&tempdir);
+    }
+
+    #[test]
     fn test_patch_device_slots_ensure_no_write_non_chained() {
         use std::collections::HashMap;
         use crate::io_delegate::MockDevice;
