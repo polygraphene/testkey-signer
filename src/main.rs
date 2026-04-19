@@ -432,12 +432,20 @@ enum Commands {
         /// Disable verity for partition.
         #[arg(short = 'd', long = "disable-verity")]
         disable_verity: bool,
+
+        /// Override supported partitions.
+        #[arg(short = 'p', long = "partition")]
+        partitions: Option<Vec<String>>,
     },
     /// Verify current slot partitions.
     VerifyDevice {
         /// Verify inactive slot instead of current slot.
         #[arg(short = 'i', long = "inactive-slot")]
         inactive_slot: bool,
+
+        /// Override supported partitions.
+        #[arg(short = 'p', long = "partition")]
+        partitions: Option<Vec<String>>,
     },
     /// Patch files. Files will be patched in place.
     #[command(arg_required_else_help = true)]
@@ -479,19 +487,20 @@ fn run(args: Args, env: &dyn Environment) -> Result<()> {
             yes,
             dry_run,
             boot_spl,
-            disable_verity
+            disable_verity,
+            partitions
         } => {
             let run_mode = if dry_run {
                 RunMode::DryRun
             } else {
                 RunMode::Patch { yes }
             };
-            run_patch_device(env, inactive_slot, run_mode, PatchOptions { boot_spl, disable_verity })?;
+            run_patch_device(env, inactive_slot, partitions, run_mode, PatchOptions { boot_spl, disable_verity })?;
             return Ok(());
         }
-        Commands::VerifyDevice { inactive_slot } => {
+        Commands::VerifyDevice { inactive_slot, partitions } => {
             let run_mode = RunMode::VerifyOnly;
-            let result = run_patch_device(env, inactive_slot, run_mode, PatchOptions { boot_spl: None, disable_verity: false })?;
+            let result = run_patch_device(env, inactive_slot, partitions, run_mode, PatchOptions { boot_spl: None, disable_verity: false })?;
             print_verification_result(&result, args.json);
 
             return Ok(());
@@ -581,7 +590,7 @@ fn get_test_key(key_num_bits: KeyBits) -> Result<RsaPrivateKey> {
     Ok(RsaPrivateKey::from_pkcs1_pem(String::from_utf8(testkey.to_vec())?.as_str())?)
 }
 
-fn run_patch_device(env: &dyn Environment, inactive_slot: bool, run_mode: RunMode, patch_options: PatchOptions) -> Result<VerificationResult> {
+fn run_patch_device(env: &dyn Environment, inactive_slot: bool, partitions: Option<Vec<String>>, run_mode: RunMode, patch_options: PatchOptions) -> Result<VerificationResult> {
     let slot_suffix = env.get_prop("ro.boot.slot_suffix").unwrap_or_default();
     if !slot_suffix.is_empty() {
         info!("Current slot: {}", slot_suffix.trim_start_matches("_"));
@@ -605,7 +614,14 @@ fn run_patch_device(env: &dyn Environment, inactive_slot: bool, run_mode: RunMod
         info!("Target slot: {}", slot_suffix.trim_start_matches("_"));
     }
     let mut partition_set = HashMap::new();
-    for partition in SUPPORTED_PARTITIONS {
+    
+    let partition_list: Vec<&str> = if let Some(ref p) = partitions {
+        p.iter().map(|s| s.as_str()).collect()
+    } else {
+        SUPPORTED_PARTITIONS.to_vec()
+    };
+
+    for partition in &partition_list {
         let path = format!("/dev/block/by-name/{partition}{slot_suffix}");
         if env.device_exists(&path) {
             partition_set.insert(
@@ -1351,7 +1367,7 @@ mod tests {
         // Patch active slot (_a)
         run(
             Args {
-                command: Commands::PatchDevice { yes: true, inactive_slot: false, dry_run: false, boot_spl: Some("Modified boot spl".to_string()), disable_verity: false },
+                command: Commands::PatchDevice { yes: true, inactive_slot: false, dry_run: false, boot_spl: Some("Modified boot spl".to_string()), disable_verity: false, partitions: None },
                 log_level: Some("info".to_string()),
                 json: false,
             },
@@ -1375,7 +1391,7 @@ mod tests {
         // Patch inactive slot (_b)
         run(
             Args {
-                command: Commands::PatchDevice { yes: true, inactive_slot: true, dry_run: false, boot_spl: Some("Modified boot spl 2".to_string()), disable_verity: false },
+                command: Commands::PatchDevice { yes: true, inactive_slot: true, dry_run: false, boot_spl: Some("Modified boot spl 2".to_string()), disable_verity: false, partitions: None },
                 log_level: Some("info".to_string()),
                 json: false,
             },
@@ -1434,7 +1450,7 @@ mod tests {
 
         run(
             Args {
-                command: Commands::PatchDevice { yes: true, inactive_slot: false, dry_run: false, boot_spl: Some("Modified boot spl".to_string()), disable_verity: false },
+                command: Commands::PatchDevice { yes: true, inactive_slot: false, dry_run: false, boot_spl: Some("Modified boot spl".to_string()), disable_verity: false, partitions: None },
                 log_level: Some("info".to_string()),
                 json: false,
             },
@@ -1498,7 +1514,7 @@ mod tests {
 
         run(
             Args {
-                command: Commands::PatchDevice { yes: true, inactive_slot: false, dry_run: false, boot_spl: None, disable_verity: false },
+                command: Commands::PatchDevice { yes: true, inactive_slot: false, dry_run: false, boot_spl: None, disable_verity: false, partitions: None },
                 log_level: Some("info".to_string()),
                 json: false,
             },
@@ -1778,6 +1794,7 @@ mod tests {
                         dry_run: false,
                         boot_spl: Some("Modified boot spl".to_string()),
                         disable_verity: false,
+                        partitions: None,
                     },
                     log_level: Some("info".to_string()),
                     json: false,
@@ -1886,7 +1903,7 @@ mod tests {
         // Patch active slot (_a) with --dry-run
         run(
             Args {
-                command: Commands::PatchDevice { yes: true, inactive_slot: false, dry_run: true, boot_spl: Some("Modified boot spl".to_string()), disable_verity: false },
+                command: Commands::PatchDevice { yes: true, inactive_slot: false, dry_run: true, boot_spl: Some("Modified boot spl".to_string()), disable_verity: false, partitions: None },
                 log_level: Some("info".to_string()),
                 json: false,
             },
@@ -1911,7 +1928,7 @@ mod tests {
         // Patch active slot (_a) without --dry-run
         run(
             Args {
-                command: Commands::PatchDevice { yes: true, inactive_slot: false, dry_run: false, boot_spl: Some("Modified boot spl".to_string()), disable_verity: false },
+                command: Commands::PatchDevice { yes: true, inactive_slot: false, dry_run: false, boot_spl: Some("Modified boot spl".to_string()), disable_verity: false, partitions: None },
                 log_level: Some("info".to_string()),
                 json: false,
             },
