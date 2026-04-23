@@ -135,7 +135,7 @@ struct PartitionResult {
     vbmeta_hashes_match: Option<bool>,
     vbmeta_signatures_match: Option<bool>,
     partition_info: Option<PartitionInfo>,
-    incorrect_hash_descriptor_num: Option<usize>,
+    modified_descriptor_num: Option<usize>,
     is_testkey: bool,
     boot_spl: Option<String>,
 }
@@ -221,7 +221,7 @@ fn parse_vbmeta(f: &mut dyn IoDelegate, is_vbmeta: bool, replace_hash_descriptor
     let mut parititon_sizes_match = false;
     let mut new_descriptors = vec![];
     let mut parent_vbmeta_hash_descriptor = None;
-    let mut incorrect_hash_descriptor_num = 0;
+    let mut modified_descriptor_num = 0;
     for descriptor in &vbmeta.descriptors {
         match descriptor {
             AvbDescriptorEnum::Hash(hash_descriptor) => {
@@ -273,7 +273,7 @@ fn parse_vbmeta(f: &mut dyn IoDelegate, is_vbmeta: bool, replace_hash_descriptor
                                 } else {
                                     info!("Replacing hash descriptors for {partition_name} in vbmeta partition.");
                                     trace!("{}", hexdump(&new_hash_desc.to_be_bytes()));
-                                    incorrect_hash_descriptor_num += 1;
+                                    modified_descriptor_num += 1;
                                     new_descriptors.push(AvbDescriptorEnum::Hash(new_hash_desc.clone()));
                                 }
                             } else {
@@ -295,6 +295,7 @@ fn parse_vbmeta(f: &mut dyn IoDelegate, is_vbmeta: bool, replace_hash_descriptor
                         let test_key = get_test_key(*key_bits)?;
                         if chain_descriptor.get_public_key()? != test_key.to_public_key() {
                             info!("Replacing public key in chain descriptor for {partition_name} in vbmeta partition.");
+                            modified_descriptor_num += 1;
                             new_chain_descriptor.set_public_key(&test_key.to_public_key())?;
                         }
                     }
@@ -331,12 +332,12 @@ fn parse_vbmeta(f: &mut dyn IoDelegate, is_vbmeta: bool, replace_hash_descriptor
         vbmeta_hashes_match,
         vbmeta_signatures_match,
         partition_info,
-        incorrect_hash_descriptor_num: if replace_hash_descriptors.is_some() { Some(incorrect_hash_descriptor_num) } else { None },
+        modified_descriptor_num: if replace_hash_descriptors.is_some() || replace_chain_descriptors.is_some() { Some(modified_descriptor_num) } else { None },
         is_testkey,
         boot_spl,
     };
 
-    let needs_patching = !verification_result.is_valid() || (replace_hash_descriptors.is_some() && incorrect_hash_descriptor_num != 0);
+    let needs_patching = !verification_result.is_valid() || ((replace_hash_descriptors.is_some() || replace_chain_descriptors.is_some()) && modified_descriptor_num != 0);
 
     Ok(ParsedHeaders {
         key_num_bits: key_bits,
@@ -719,7 +720,7 @@ fn parse_other_partitions<'a>(
             }
         }
         info!("Needs patching: {}", parsed.needs_patching);
-        if parsed.needs_patching && parsed.key_num_bits.is_some() {
+        if parsed.key_num_bits.is_some() {
             info!("Saving key num bits for chained descriptor");
             replace_chain_descriptors.insert(partition.name.clone(), parsed.key_num_bits.unwrap());
         }
@@ -761,7 +762,7 @@ fn process_vbmeta_partition(
             }
             info!("=== Partition vbmeta ===");
             parsed.verification_result.print_result();
-            let parent_descriptors_ok = parsed.verification_result.incorrect_hash_descriptor_num.expect("Should have incorrect_hash_descriptor_num") == 0;
+            let parent_descriptors_ok = parsed.verification_result.modified_descriptor_num.expect("Should have modified_descriptor_num") == 0;
             info!("Parent descriptors ok: {}", ok_ng(parent_descriptors_ok));
             info!("Signed by testkey?: {}", ok_ng(parsed.verification_result.is_testkey));
 
@@ -1640,15 +1641,15 @@ mod tests {
         assert!(result.partition_results.contains_key("init_boot"));
         for (name, partition_result) in result.partition_results.iter() {
             if name == "vbmeta" {
-                assert_eq!(partition_result.incorrect_hash_descriptor_num, Some(0));
+                assert_eq!(partition_result.modified_descriptor_num, Some(0));
             } else if name == "boot" {
-                assert_eq!(partition_result.incorrect_hash_descriptor_num, None);
+                assert_eq!(partition_result.modified_descriptor_num, None);
                 assert_eq!(partition_result.vbmeta_hashes_match, Some(true));
                 assert_eq!(partition_result.vbmeta_signatures_match, Some(true));
                 assert_eq!(partition_result.partition_info.as_ref().unwrap().partition_hashes_match, true);
                 assert_eq!(partition_result.partition_info.as_ref().unwrap().partition_sizes_match, true);
             } else if name == "init_boot" {
-                assert_eq!(partition_result.incorrect_hash_descriptor_num, None);
+                assert_eq!(partition_result.modified_descriptor_num, None);
                 assert_eq!(partition_result.vbmeta_hashes_match, None);
                 assert_eq!(partition_result.vbmeta_signatures_match, None);
                 assert_eq!(partition_result.partition_info.as_ref().unwrap().partition_hashes_match, true);
@@ -1669,18 +1670,18 @@ mod tests {
         assert!(result.partition_results.contains_key("init_boot"));
         for (name, partition_result) in result.partition_results.iter() {
             if name == "vbmeta" {
-                assert_eq!(partition_result.incorrect_hash_descriptor_num, Some(0));
+                assert_eq!(partition_result.modified_descriptor_num, Some(0));
                 assert_eq!(partition_result.vbmeta_hashes_match, Some(true));
                 assert_eq!(partition_result.vbmeta_signatures_match, Some(true));
                 assert!(partition_result.partition_info.is_none());
             } else if name == "boot" {
-                assert_eq!(partition_result.incorrect_hash_descriptor_num, None);
+                assert_eq!(partition_result.modified_descriptor_num, None);
                 assert_eq!(partition_result.vbmeta_hashes_match, Some(true));
                 assert_eq!(partition_result.vbmeta_signatures_match, Some(true));
                 assert_eq!(partition_result.partition_info.as_ref().unwrap().partition_hashes_match, false);
                 assert_eq!(partition_result.partition_info.as_ref().unwrap().partition_sizes_match, true);
             } else if name == "init_boot" {
-                assert_eq!(partition_result.incorrect_hash_descriptor_num, None);
+                assert_eq!(partition_result.modified_descriptor_num, None);
                 assert_eq!(partition_result.vbmeta_hashes_match, None);
                 assert_eq!(partition_result.vbmeta_signatures_match, None);
                 assert_eq!(partition_result.partition_info.as_ref().unwrap().partition_hashes_match, true);
@@ -1701,18 +1702,18 @@ mod tests {
         assert!(result.partition_results.contains_key("init_boot"));
         for (name, partition_result) in result.partition_results.iter() {
             if name == "vbmeta" {
-                assert_eq!(partition_result.incorrect_hash_descriptor_num, Some(1));
+                assert_eq!(partition_result.modified_descriptor_num, Some(1));
                 assert_eq!(partition_result.vbmeta_hashes_match, Some(true));
                 assert_eq!(partition_result.vbmeta_signatures_match, Some(true));
                 assert!(partition_result.partition_info.is_none());
             } else if name == "boot" {
-                assert_eq!(partition_result.incorrect_hash_descriptor_num, None);
+                assert_eq!(partition_result.modified_descriptor_num, None);
                 assert_eq!(partition_result.vbmeta_hashes_match, Some(true));
                 assert_eq!(partition_result.vbmeta_signatures_match, Some(true));
                 assert_eq!(partition_result.partition_info.as_ref().unwrap().partition_hashes_match, false);
                 assert_eq!(partition_result.partition_info.as_ref().unwrap().partition_sizes_match, true);
             } else if name == "init_boot" {
-                assert_eq!(partition_result.incorrect_hash_descriptor_num, None);
+                assert_eq!(partition_result.modified_descriptor_num, None);
                 assert_eq!(partition_result.vbmeta_hashes_match, None);
                 assert_eq!(partition_result.vbmeta_signatures_match, None);
                 assert_eq!(partition_result.partition_info.as_ref().unwrap().partition_hashes_match, false);
@@ -1785,7 +1786,7 @@ mod tests {
         assert!(result.all_ok);
         assert_eq!(result.hash_descriptors_match, Some(true));
         assert!(result.partition_results.contains_key("vbmeta"));
-        assert_eq!(result.partition_results.get("vbmeta").unwrap().incorrect_hash_descriptor_num, Some(0));
+        assert_eq!(result.partition_results.get("vbmeta").unwrap().modified_descriptor_num, Some(0));
         assert_eq!(result.partition_results.get("vbmeta").unwrap().vbmeta_hashes_match, Some(true));
         assert_eq!(result.partition_results.get("vbmeta").unwrap().vbmeta_signatures_match, Some(true));
         assert!(!result.partition_results.get("vbmeta").unwrap().is_testkey);
@@ -1821,7 +1822,7 @@ mod tests {
         assert!(result.all_ok);
         assert_eq!(result.hash_descriptors_match, Some(true));
         assert!(result.partition_results.contains_key("vbmeta"));
-        assert_eq!(result.partition_results.get("vbmeta").unwrap().incorrect_hash_descriptor_num, Some(0));
+        assert_eq!(result.partition_results.get("vbmeta").unwrap().modified_descriptor_num, Some(0));
         assert_eq!(result.partition_results.get("vbmeta").unwrap().vbmeta_hashes_match, Some(true));
         assert_eq!(result.partition_results.get("vbmeta").unwrap().vbmeta_signatures_match, Some(true));
         assert!(result.partition_results.get("vbmeta").unwrap().is_testkey);
