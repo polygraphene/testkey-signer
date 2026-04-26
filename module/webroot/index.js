@@ -44,7 +44,33 @@ window.onload = async () => {
     console.log(active_slot_json);
     console.log(inactive_slot_json);
 
+    await loadSettings();
+
     update();
+}
+
+async function loadSettings() {
+    try {
+        const res = await exec(`cat /data/adb/testkey-signer/settings.json`);
+        if (res.stdout) {
+            const settings = JSON.parse(res.stdout);
+            if (settings.verity_disable !== undefined) {
+                document.getElementById("verity-disable").checked = settings.verity_disable;
+            }
+            if (settings.boot_spl !== undefined) {
+                document.getElementById("boot-spl").value = settings.boot_spl;
+            }
+        }
+    } catch (e) {
+        console.error(e);
+    }
+}
+
+async function saveSettings() {
+    const verityDisable = document.getElementById("verity-disable").checked;
+    const bootSpl = document.getElementById("boot-spl").value.trim();
+    const settings = JSON.stringify({ verity_disable: verityDisable, boot_spl: bootSpl });
+    await exec(`mkdir -p /data/adb/testkey-signer && echo '${settings}' > /data/adb/testkey-signer/settings.json`);
 }
 
 function update() {
@@ -138,6 +164,7 @@ document.getElementById("patch-current-slot").addEventListener("click", async ()
         args.push('--boot-spl', bootSpl);
     }
 
+    await saveSettings();
     await run(args, true);
     active_slot_json = JSON.parse(await run(['verify-device', '--json'], false));
     update();
@@ -157,6 +184,7 @@ document.getElementById("patch-inactive-slot").addEventListener("click", async (
         args.push('--boot-spl', bootSpl);
     }
 
+    await saveSettings();
     await run(args, true);
     inactive_slot_json = JSON.parse(await run(['verify-device', '--json', '--inactive-slot'], false));
     update();
